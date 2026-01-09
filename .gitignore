@@ -1,0 +1,16 @@
+# Go
+/bin/
+/dist/
+*.exe
+*.out
+
+# OS
+.DS_Store
+
+# Archive runtime data
+/osimi-data/
+/*.sqlite
+*.db
+
+# Temp
+*.tmp
