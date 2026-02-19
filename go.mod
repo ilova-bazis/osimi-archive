@@ -2,6 +2,8 @@ module github.com/ilova-bazis/osimi-archive
 
 go 1.25.4
 
+require modernc.org/sqlite v1.43.0
+
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
@@ -13,5 +15,4 @@ require (
 	modernc.org/libc v1.66.10 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
-	modernc.org/sqlite v1.43.0 // indirect
 )

@@ -126,8 +126,10 @@ This directory represents the **archival source of truth**.
 
 ```
 derivatives/
-  pdf/
-    access_v1.pdf
+  access/
+    reading_v1.pdf        # image-only, no OCR, fast
+  delivery/
+    reading_ocr_v1.pdf    # OCR-enhanced, for human delivery
   images/
     web/
       page_0001.jpg
@@ -138,10 +140,15 @@ derivatives/
 ```
 
 ### Notes
-- `access_v1.pdf` is the default reading/download PDF.
+- `derivatives/access/` contains image-only PDFs that are fast to generate.
+- `derivatives/delivery/` contains user-facing, OCR-enhanced PDFs.
+- Delivery PDFs are regenerable and not authoritative.
 - `web/` images are optimized for fast UI viewing.
 - `thumb/` images are optimized for previews.
 - All derivative content can be regenerated from `original/`.
+
+### Invariants
+- Any file under `derivatives/delivery/` may be deleted and regenerated at any time without data loss.
 
 ---
 

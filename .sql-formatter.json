@@ -1,0 +1,11 @@
+{
+  "language": "sqlite",
+  "keywordCase": "upper",
+  "tabWidth": 4,
+  "linesBetweenQueries": 2,
+  "logicalOperatorNewline": "before",
+  "denseOperators": false,
+  "expressionWidth": 80,
+  "preserveLineBreaks": true,
+  "newlineBeforeJoin": true
+}

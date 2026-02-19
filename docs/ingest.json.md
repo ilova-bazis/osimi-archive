@@ -112,6 +112,10 @@ All paths inside the manifest are **relative to the object root** unless explici
 
 Derivatives are **replaceable** outputs generated from originals.
 
+Optional delivery artifacts (v1):
+- `derivatives/delivery/reading_ocr_v1.pdf` may be generated eagerly or lazily.
+- It is non-authoritative and does **not** affect `has_ocr` or search readiness.
+
 ### `derivatives.pdf[]`
 
 | Field | Type | Description |
@@ -180,7 +184,12 @@ OCR runs are versioned so the archive can be reprocessed.
 | Field | Type | Description |
 |---|---|---|
 | `path` | string | Relative path to checksum file (e.g. `checksums/sha256.txt`) |
-| `covers` | array[string] | What categories it covers (`original`, `derivatives`, `ocr`) |
+| `covers` | array[string] | What categories it covers (stage-dependent; see below) |
+
+Coverage by stage (v1):
+- Ingest stage: covers `original` (and optionally `meta`)
+- After derivatives: covers include `derivatives`
+- After OCR: covers include `ocr`
 
 ---
 

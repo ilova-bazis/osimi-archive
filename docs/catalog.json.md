@@ -174,6 +174,33 @@ This allows unknown/approx dates without breaking structure.
 
 These are recommended but not required for v1.
 
+### `item_kind` (processing hint)
+
+A simple hint for default processing choices.
+
+Suggested values:
+- `scanned_document`
+- `photo`
+- `audio`
+- `other`
+
+### `processing` (intent)
+
+Declares desired processing steps; used by the orchestrator.
+
+Example:
+
+```json
+"processing": {
+  "ocr_text": { "enabled": true, "language": "tg" },
+  "audio_transcript": { "enabled": false }
+}
+```
+
+Notes:
+- If omitted, defaults are inferred from `item_kind` and `classification.language`.
+- This block never contains pipeline state or machine outputs.
+
 ### `publication` (where it appeared)
 
 - `name` (e.g. newspaper/magazine title)

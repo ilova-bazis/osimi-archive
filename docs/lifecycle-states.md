@@ -97,6 +97,14 @@ If any check fails → `curation_failed`.
 
 ---
 
+## OCR and delivery PDFs
+
+- OCR text pipeline controls `has_ocr`, `has_index`, and search readiness.
+- OCR-enhanced delivery PDFs (e.g. `reading_ocr_v1.pdf`) do **not** gate lifecycle states.
+- An object may be fully searchable even if no delivery PDF exists yet.
+
+---
+
 ## State transitions (v1)
 
 ### Typical happy path
