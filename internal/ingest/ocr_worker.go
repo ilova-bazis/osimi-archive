@@ -148,6 +148,11 @@ func (w *OCRWorker) processOCR(ctx context.Context, objectID, jobID, lang string
 	if err := writeObjectEvent(objectRoot, objectID, jobID, "ocr", "ocr_completed", "info", "ocr completed"); err != nil {
 		log.Printf("ocr worker event error: %v", err)
 	}
+
+	if err := w.writePipelineManifest(ctx, objectRoot, objectID, jobID); err != nil {
+		log.Printf("ocr worker write pipeline manifest failed: %v", err)
+	}
+
 	return nil
 }
 
@@ -205,4 +210,29 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	}
 	// Best-effort fsync directory would be ideal later; v1 keep simple
 	return os.Rename(tmp, path)
+}
+
+func (w *OCRWorker) writePipelineManifest(ctx context.Context, objectRoot, objectID, jobID string) error {
+	artifacts, err := ScanOCRArtifacts(objectRoot)
+	if err != nil {
+		return err
+	}
+	if len(artifacts) == 0 {
+		return nil
+	}
+
+	version := w.OCRVersion
+	if version == "" {
+		version = "v1"
+	}
+
+	if err := WritePipelineManifest(objectRoot, "ocr", artifacts, version); err != nil {
+		return err
+	}
+
+	if err := w.DB.EnqueueBackendObjectTask(ctx, objectID, "available_files_snapshot", "ocr_completed"); err != nil {
+		log.Printf("ocr worker enqueue backend object task failed: %v", err)
+	}
+
+	return nil
 }

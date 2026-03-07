@@ -15,6 +15,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/ilova-bazis/osimi-archive/internal/db"
 )
 
@@ -113,7 +115,7 @@ type fileEntry struct {
 	Bytes          int64  `json:"bytes"`
 }
 
-func copyCatalogIfMissing(batchPath, objectRoot, objectID string) (string, error) {
+func validateCatalogFile(batchPath, objectID string) (string, error) {
 	src := filepath.Join(batchPath, "catalog.json")
 	data, err := os.ReadFile(src)
 	if err != nil {
@@ -141,26 +143,63 @@ func copyCatalogIfMissing(batchPath, objectRoot, objectID string) (string, error
 	if strings.TrimSpace(catalog.Title.Primary) == "" {
 		return "", fmt.Errorf("catalog.json missing title.primary")
 	}
-	if strings.TrimSpace(catalog.ItemKind) == "" && strings.TrimSpace(catalog.Classification.Type) == "" {
-		return "", fmt.Errorf("catalog.json missing item_kind or classification.type")
+
+	itemKind := strings.TrimSpace(catalog.ItemKind)
+	classificationType := strings.TrimSpace(catalog.Classification.Type)
+
+	validItemKinds := map[string]bool{
+		"photo":            true,
+		"audio":            true,
+		"video":            true,
+		"scanned_document": true,
+		"document":         true,
+		"other":            true,
 	}
+
+	if itemKind != "" {
+		if !validItemKinds[itemKind] {
+			return "", fmt.Errorf("catalog.json item_kind '%s' is not supported", itemKind)
+		}
+	} else if classificationType == "" {
+		return "", fmt.Errorf("catalog.json missing item_kind or classification.type")
+	} else if itemKind == "document" || itemKind == "scanned_document" {
+		if classificationType == "" {
+			return "", fmt.Errorf("catalog.json classification.type is required for item_kind '%s'", itemKind)
+		}
+	}
+
 	if catalog.Dates == nil {
 		return "", fmt.Errorf("catalog.json missing dates block")
 	}
 
-	itemKind := resolveIngestItemKind(catalog)
-	if itemKind == "" {
+	resolvedKind := resolveIngestItemKind(catalog)
+	if resolvedKind == "" {
 		return "", fmt.Errorf("catalog.json item_kind is not supported")
 	}
+	return resolvedKind, nil
+}
 
+func copyCatalogIfMissing(batchPath, objectRoot string) error {
+	src := filepath.Join(batchPath, "catalog.json")
 	dst := filepath.Join(objectRoot, "meta", "catalog.json")
 	if _, err := os.Stat(dst); err == nil {
-		return itemKind, nil
+		return nil
 	} else if !os.IsNotExist(err) {
-		return "", err
+		return err
 	}
-	_, err = copyFileAtomic(src, dst)
-	return itemKind, err
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	var raw any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	formatted, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, formatted, 0644)
 }
 
 func appendBatchError(batchPath string, err error) {
@@ -180,6 +219,127 @@ func appendBatchError(batchPath string, err error) {
 	}
 }
 
+func postBatchIngestionFailed(ctx context.Context, d *db.DB, batchPath string, cause error) {
+	if d == nil {
+		return
+	}
+	ingestionID, _, err := readBatchLeaseInfo(batchPath)
+	if err != nil {
+		log.Printf("worker ingestion failed missing lease info: %v", err)
+		return
+	}
+	message, err := readBatchErrorFile(batchPath)
+	if err != nil || message == "" {
+		if cause != nil {
+			message = cause.Error()
+		}
+	}
+	payload := map[string]any{
+		"step":  "ingest",
+		"error": message,
+	}
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("worker ingestion failed marshal error: %v", err)
+		return
+	}
+	ev := db.VPSEvent{
+		EventID:     uuid.NewString(),
+		IngestionID: ingestionID,
+		EventType:   "INGESTION_FAILED",
+		PayloadJSON: string(payloadJSON),
+	}
+	if err := d.EnqueueVPSEvent(ctx, ev); err != nil {
+		log.Printf("worker ingestion failed enqueue error: %v", err)
+		return
+	}
+	if err := d.SetIngestionLeaseState(ctx, ingestionID, "completed"); err != nil {
+		log.Printf("worker ingestion failed set state error: %v", err)
+	}
+}
+
+func postIngestionCompletion(ctx context.Context, d *db.DB, ingestionID, objectID string, ingestManifest any) error {
+	if d == nil || ingestionID == "" {
+		return nil
+	}
+
+	completedPayload := map[string]any{
+		"step":        "ingest",
+		"object_id":   objectID,
+		"ingest_json": ingestManifest,
+	}
+	completedJSON, err := json.Marshal(completedPayload)
+	if err != nil {
+		return err
+	}
+	completedEv := db.VPSEvent{
+		EventID:     uuid.NewString(),
+		IngestionID: ingestionID,
+		ObjectID:    sql.NullString{String: objectID, Valid: objectID != ""},
+		EventType:   "INGESTION_COMPLETED",
+		PayloadJSON: string(completedJSON),
+	}
+	if err := d.EnqueueVPSEvent(ctx, completedEv); err != nil {
+		return err
+	}
+
+	createdPayload := map[string]any{
+		"object_id": objectID,
+	}
+	createdJSON, err := json.Marshal(createdPayload)
+	if err != nil {
+		return err
+	}
+	createdEv := db.VPSEvent{
+		EventID:     uuid.NewString(),
+		IngestionID: ingestionID,
+		ObjectID:    sql.NullString{String: objectID, Valid: objectID != ""},
+		EventType:   "OBJECT_CREATED",
+		PayloadJSON: string(createdJSON),
+	}
+	if err := d.EnqueueVPSEvent(ctx, createdEv); err != nil {
+		return err
+	}
+
+	if err := d.EnqueueBackendObjectTask(ctx, objectID, "available_files_snapshot", "ingest_completed"); err != nil {
+		return err
+	}
+
+	if err := d.SetIngestionLeaseState(ctx, ingestionID, "completed"); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func readBatchLeaseInfo(batchPath string) (string, string, error) {
+	ingestionPath := filepath.Join(batchPath, "INGESTION_ID")
+	leasePath := filepath.Join(batchPath, "LEASE_TOKEN")
+	ingestionBytes, err := os.ReadFile(ingestionPath)
+	if err != nil {
+		return "", "", err
+	}
+	leaseBytes, err := os.ReadFile(leasePath)
+	if err != nil {
+		return "", "", err
+	}
+	ingestionID := strings.TrimSpace(string(ingestionBytes))
+	leaseToken := strings.TrimSpace(string(leaseBytes))
+	if ingestionID == "" || leaseToken == "" {
+		return "", "", fmt.Errorf("ingestion id or lease token is empty")
+	}
+	return ingestionID, leaseToken, nil
+}
+
+func readBatchErrorFile(batchPath string) (string, error) {
+	path := filepath.Join(batchPath, "ERROR")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
 func resolveIngestItemKind(catalog ingestCatalog) string {
 	kind := strings.TrimSpace(catalog.ItemKind)
 	if kind != "" {
@@ -187,16 +347,14 @@ func resolveIngestItemKind(catalog ingestCatalog) string {
 	}
 	kind = strings.TrimSpace(catalog.Classification.Type)
 	switch kind {
-	case "photo":
+	case "image":
 		return "photo"
-	case "audio":
-		return "audio"
-	case "video":
-		return "video"
 	case "document":
 		return "document"
-	case "book", "book_chapter", "newspaper_article", "magazine_article", "letter", "speech", "interview":
+	case "newspaper_article", "magazine_article", "book_chapter", "book", "letter", "speech", "interview", "report", "manuscript":
 		return "scanned_document"
+	case "other":
+		return "other"
 	default:
 		return ""
 	}
@@ -230,6 +388,8 @@ func detectBatchMedia(batchPath string) (mediaKind, []string, error) {
 	ignored := map[string]struct{}{
 		"catalog.json": {},
 		"DONE":         {},
+		"INGESTION_ID": {},
+		"LEASE_TOKEN":  {},
 		"ENQUEUED":     {},
 		"ERROR":        {},
 	}
@@ -263,9 +423,51 @@ func detectBatchMedia(batchPath string) (mediaKind, []string, error) {
 	return kinds[0], files, nil
 }
 
+type ingestRouting struct {
+	destSubdir string
+	prefix     string
+	usePages   bool
+}
+
+func resolveIngestRouting(itemKind string, mediaType mediaKind) (ingestRouting, error) {
+	switch itemKind {
+	case "photo":
+		if mediaType != mediaImage {
+			return ingestRouting{}, fmt.Errorf("item_kind 'photo' requires image media, got %s", mediaType)
+		}
+		return ingestRouting{destSubdir: "photos", prefix: "photo_", usePages: false}, nil
+	case "scanned_document":
+		if mediaType != mediaImage {
+			return ingestRouting{}, fmt.Errorf("item_kind 'scanned_document' requires image media, got %s", mediaType)
+		}
+		return ingestRouting{destSubdir: "pages", prefix: "page_", usePages: true}, nil
+	case "document":
+		if mediaType != mediaDocument {
+			return ingestRouting{}, fmt.Errorf("item_kind 'document' requires document media, got %s", mediaType)
+		}
+		return ingestRouting{destSubdir: "document", prefix: "document_", usePages: false}, nil
+	case "audio":
+		if mediaType != mediaAudio {
+			return ingestRouting{}, fmt.Errorf("item_kind 'audio' requires audio media, got %s", mediaType)
+		}
+		return ingestRouting{destSubdir: "audio", prefix: "audio_", usePages: false}, nil
+	case "video":
+		if mediaType != mediaVideo {
+			return ingestRouting{}, fmt.Errorf("item_kind 'video' requires video media, got %s", mediaType)
+		}
+		return ingestRouting{destSubdir: "video", prefix: "video_", usePages: false}, nil
+	case "other":
+		return ingestRouting{destSubdir: "other", prefix: "file_", usePages: false}, nil
+	default:
+		return ingestRouting{}, fmt.Errorf("unsupported item_kind: %s", itemKind)
+	}
+}
+
 func matchesItemKind(itemKind string, kind mediaKind) bool {
 	switch itemKind {
-	case "scanned_document", "photo":
+	case "photo":
+		return kind == mediaImage
+	case "scanned_document":
 		return kind == mediaImage
 	case "audio":
 		return kind == mediaAudio
@@ -273,6 +475,8 @@ func matchesItemKind(itemKind string, kind mediaKind) bool {
 		return kind == mediaVideo
 	case "document":
 		return kind == mediaDocument
+	case "other":
+		return true
 	default:
 		return false
 	}
@@ -303,11 +507,17 @@ func copyMediaFiles(files []string, dstDir, prefix string) ([]fileEntry, error) 
 }
 
 func (w *Worker) processIngest(ctx context.Context, objectID, jobID, batchPath string) error {
-
 	objectRoot, err := w.DB.GetObjectRoot(ctx, objectID)
 
 	if err != nil {
 		appendBatchError(batchPath, err)
+		return err
+	}
+
+	itemKind, err := validateCatalogFile(batchPath, objectID)
+	if err != nil {
+		appendBatchError(batchPath, err)
+		postBatchIngestionFailed(ctx, w.DB, batchPath, err)
 		return err
 	}
 
@@ -318,9 +528,9 @@ func (w *Worker) processIngest(ctx context.Context, objectID, jobID, batchPath s
 	}
 
 	// Validate + copy catalog.json before heavy work
-	itemKind, err := copyCatalogIfMissing(batchPath, objectRoot, objectID)
-	if err != nil {
+	if err := copyCatalogIfMissing(batchPath, objectRoot); err != nil {
 		appendBatchError(batchPath, err)
+		postBatchIngestionFailed(ctx, w.DB, batchPath, err)
 		return err
 	}
 
@@ -344,10 +554,18 @@ func (w *Worker) processIngest(ctx context.Context, objectID, jobID, batchPath s
 	if !matchesItemKind(itemKind, mediaType) {
 		err := fmt.Errorf("batch media type %s does not match item_kind %s", mediaType, itemKind)
 		appendBatchError(batchPath, err)
+		postBatchIngestionFailed(ctx, w.DB, batchPath, err)
 		return err
 	}
 
-	// Copy into original/ with deterministic naming
+	// Copy into original/ with deterministic naming using routing
+	route, err := resolveIngestRouting(itemKind, mediaType)
+	if err != nil {
+		appendBatchError(batchPath, err)
+		postBatchIngestionFailed(ctx, w.DB, batchPath, err)
+		return err
+	}
+
 	type pageEntry struct {
 		PageNumber     int    `json:"page_number"`
 		Filename       string `json:"filename"`
@@ -358,15 +576,15 @@ func (w *Worker) processIngest(ctx context.Context, objectID, jobID, batchPath s
 
 	originalCount := 0
 	var manifest ingestManifestV1
-	switch mediaType {
-	case mediaImage:
+	dstDir := filepath.Join(objectRoot, "original", route.destSubdir)
+
+	if route.usePages {
 		pages := make([]pageEntry, 0, len(batchFiles))
-		dstPagesDir := filepath.Join(objectRoot, "original", "pages")
 		for i, src := range batchFiles {
 			pageNum := i + 1
 			ext := strings.ToLower(filepath.Ext(src))
-			dstName := fmt.Sprintf("page_%04d%s", pageNum, ext)
-			dstPath := filepath.Join(dstPagesDir, dstName)
+			dstName := fmt.Sprintf("%s%04d%s", route.prefix, pageNum, ext)
+			dstPath := filepath.Join(dstDir, dstName)
 			n, err := copyFileAtomic(src, dstPath)
 			if err != nil {
 				err = fmt.Errorf("copy page %d: %w", pageNum, err)
@@ -383,32 +601,14 @@ func (w *Worker) processIngest(ctx context.Context, objectID, jobID, batchPath s
 		}
 		originalCount = len(pages)
 		manifest = buildIngestManifestV1(objectID, batchPath, pages, len(pages))
-	case mediaAudio:
-		entries, err := copyMediaFiles(batchFiles, filepath.Join(objectRoot, "original", "audio"), "audio")
+	} else {
+		entries, err := copyMediaFiles(batchFiles, dstDir, route.prefix)
 		if err != nil {
 			appendBatchError(batchPath, err)
 			return err
 		}
 		originalCount = len(entries)
-		manifest = buildIngestManifestV1Files(objectID, batchPath, "audio", "audio_%04d", entries, len(entries))
-	case mediaVideo:
-		entries, err := copyMediaFiles(batchFiles, filepath.Join(objectRoot, "original", "video"), "video")
-		if err != nil {
-			appendBatchError(batchPath, err)
-			return err
-		}
-		originalCount = len(entries)
-		manifest = buildIngestManifestV1Files(objectID, batchPath, "video", "video_%04d", entries, len(entries))
-	case mediaDocument:
-		entries, err := copyMediaFiles(batchFiles, filepath.Join(objectRoot, "original", "document"), "document")
-		if err != nil {
-			appendBatchError(batchPath, err)
-			return err
-		}
-		originalCount = len(entries)
-		manifest = buildIngestManifestV1Files(objectID, batchPath, "document", "document_%04d", entries, len(entries))
-	default:
-		return fmt.Errorf("unsupported media type %s", mediaType)
+		manifest = buildIngestManifestV1Files(objectID, batchPath, route.destSubdir, route.prefix+"%04d", entries, len(entries))
 	}
 
 	ingestPath := filepath.Join(objectRoot, "meta", "ingest.json")
@@ -435,6 +635,17 @@ func (w *Worker) processIngest(ctx context.Context, objectID, jobID, batchPath s
 		return err
 	}
 
+	ingestionID, _, err := readBatchLeaseInfo(batchPath)
+	if err != nil {
+		appendBatchError(batchPath, err)
+		return fmt.Errorf("read batch lease info: %w", err)
+	}
+
+	if err := postIngestionCompletion(ctx, w.DB, ingestionID, objectID, manifest); err != nil {
+		appendBatchError(batchPath, err)
+		return fmt.Errorf("post ingestion completion: %w", err)
+	}
+
 	// Mark batch imported (rename, do not delete)
 	if err := markBatchImported(batchPath, objectID); err != nil {
 		// Non-fatal: ingest already succeeded
@@ -456,9 +667,11 @@ func ensureObjectDirs(objectRoot string) error {
 	dirs := []string{
 		filepath.Join(objectRoot, "meta"),
 		filepath.Join(objectRoot, "original", "pages"),
+		filepath.Join(objectRoot, "original", "photos"),
 		filepath.Join(objectRoot, "original", "audio"),
 		filepath.Join(objectRoot, "original", "video"),
 		filepath.Join(objectRoot, "original", "document"),
+		filepath.Join(objectRoot, "original", "other"),
 		filepath.Join(objectRoot, "derivatives"),
 		filepath.Join(objectRoot, "ocr"),
 		filepath.Join(objectRoot, "checksums"),

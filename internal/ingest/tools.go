@@ -3,7 +3,9 @@ package ingest
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 )
 
 type ImageProcessor interface {
@@ -31,7 +33,7 @@ func (p *vipsProcessor) Name() string {
 }
 
 func (p *vipsProcessor) Normalize(ctx context.Context, src, dst string) error {
-	cmd := exec.CommandContext(ctx, p.path, "copy", src, dst, "--strip", "--flatten", "--interpretation", "srgb")
+	cmd := exec.CommandContext(ctx, p.path, "copy", src, fmt.Sprintf("%s[strip]", dst), "--flatten", "--interpretation", "srgb")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("vips copy failed: %s", commandError(out, err))
 	}
@@ -40,10 +42,26 @@ func (p *vipsProcessor) Normalize(ctx context.Context, src, dst string) error {
 
 func (p *vipsProcessor) Resize(ctx context.Context, src, dst string, maxSize int) error {
 	size := fmt.Sprintf("%d", maxSize)
-	cmd := exec.CommandContext(ctx, p.path, "thumbnail", src, dst, size, "--strip")
+	tmpFile, err := os.CreateTemp(filepath.Dir(dst), ".thumb-*.jpg")
+	if err != nil {
+		return fmt.Errorf("create temp thumbnail file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close temp thumbnail file: %w", err)
+	}
+	defer os.Remove(tmpPath)
+
+	cmd := exec.CommandContext(ctx, p.path, "thumbnail", src, tmpPath, size)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("vips thumbnail failed: %s", commandError(out, err))
 	}
+
+	cmd = exec.CommandContext(ctx, p.path, "copy", tmpPath, fmt.Sprintf("%s[strip]", dst))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("vips strip failed: %s", commandError(out, err))
+	}
+
 	return nil
 }
 

@@ -189,3 +189,53 @@ CREATE TABLE IF NOT EXISTS orchestrator_wakeup (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     last_signal_at TEXT NOT NULL
 );
+
+
+CREATE TABLE IF NOT EXISTS ingestion_lease_tokens (
+   ingestion_id TEXT PRIMARY KEY,
+   lease_id TEXT NOT NULL,
+   lease_token TEXT NOT NULL,
+   lease_expires_at TEXT NOT NULL,
+   state TEXT NOT NULL CHECK (state IN ('active', 'completed')),
+   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+   updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vps_events (
+    event_id TEXT PRIMARY KEY,
+    ingestion_id TEXT NOT NULL,
+    object_id TEXT,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT,
+    state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'sent', 'failed')),
+    last_error TEXT,
+    sent_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS backend_object_tasks (
+    task_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    object_id TEXT NOT NULL,
+    action_type TEXT NOT NULL CHECK (
+        action_type IN (
+            'available_files_snapshot'
+        )
+    ),
+    reason TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'processing', 'sent', 'failed')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (object_id) REFERENCES objects (object_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_backend_object_tasks_due
+    ON backend_object_tasks (state, next_attempt_at, created_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_backend_object_tasks_open_unique
+    ON backend_object_tasks (object_id, action_type)
+    WHERE state IN ('pending', 'processing', 'failed');

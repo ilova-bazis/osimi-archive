@@ -98,13 +98,13 @@ func (w *DerivativesWorker) processDerivatives(ctx context.Context, objectID, jo
 			return err
 		}
 	case "photo":
-		pagesDir := filepath.Join(objectRoot, "original", "pages")
-		sourceFiles, err := listPageFiles(pagesDir)
+		photosDir := filepath.Join(objectRoot, "original", "photos")
+		sourceFiles, err := listMediaFiles(photosDir, []string{".png", ".jpg", ".jpeg", ".tif", ".tiff"})
 		if err != nil {
 			return err
 		}
 		if len(sourceFiles) == 0 {
-			return fmt.Errorf("no pages found in %s", pagesDir)
+			return fmt.Errorf("no photo files found in %s", photosDir)
 		}
 		if err := buildPhotoDerivatives(ctx, objectRoot, sourceFiles, w.ImageProcessor); err != nil {
 			return err
@@ -149,6 +149,11 @@ func (w *DerivativesWorker) processDerivatives(ctx context.Context, objectID, jo
 	if err := writeObjectEvent(objectRoot, objectID, jobID, "derivatives", "derivatives_completed", "info", "derivatives completed"); err != nil {
 		log.Printf("derivatives worker event error: %v", err)
 	}
+
+	if err := w.writePipelineManifest(ctx, objectRoot, objectID, jobID); err != nil {
+		log.Printf("derivatives worker write pipeline manifest failed: %v", err)
+	}
+
 	return nil
 }
 
@@ -338,4 +343,24 @@ func listMediaFiles(dir string, exts []string) ([]string, error) {
 		return nil, fmt.Errorf("no media files found in %s", dir)
 	}
 	return files, nil
+}
+
+func (w *DerivativesWorker) writePipelineManifest(ctx context.Context, objectRoot, objectID, jobID string) error {
+	artifacts, err := ScanDerivativesArtifacts(objectRoot)
+	if err != nil {
+		return err
+	}
+	if len(artifacts) == 0 {
+		return nil
+	}
+
+	if err := WritePipelineManifest(objectRoot, "derivatives", artifacts, "v1"); err != nil {
+		return err
+	}
+
+	if err := w.DB.EnqueueBackendObjectTask(ctx, objectID, "available_files_snapshot", "derivatives_completed"); err != nil {
+		log.Printf("derivatives worker enqueue backend object task failed: %v", err)
+	}
+
+	return nil
 }
