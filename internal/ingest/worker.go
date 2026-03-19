@@ -34,7 +34,7 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 
-	batchPath, err := parseBatchPath(job.PayloadJSON)
+	enqueuePayload, err := parseEnqueuePayload(job.PayloadJSON)
 	if err != nil {
 		if markErr := w.DB.MarkJobFailed(ctx, job.JobID, err.Error()); markErr != nil {
 			log.Printf("worker RunOnce MarkJobFailed failed: %v", markErr)
@@ -44,9 +44,8 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 		}
 		return true, nil
 	}
-
 	// Processing ingested job
-	if err := w.processIngest(ctx, job.ObjectID, job.JobID, batchPath); err != nil {
+	if err := w.processIngest(ctx, job.ObjectID, job.JobID, enqueuePayload); err != nil {
 		objectRoot, rootErr := w.DB.GetObjectRoot(ctx, job.ObjectID)
 		if rootErr != nil {
 			log.Printf("worker RunOnce root error: %v", rootErr)
@@ -69,18 +68,18 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-func parseBatchPath(payload sql.NullString) (string, error) {
+func parseEnqueuePayload(payload sql.NullString) (EnqueuePayload, error) {
 	if !payload.Valid || strings.TrimSpace(payload.String) == "" {
-		return "", fmt.Errorf("job payload_json is missing")
+		return EnqueuePayload{}, fmt.Errorf("job payload_json is missing")
 	}
 	var p EnqueuePayload
 	if err := json.Unmarshal([]byte(payload.String), &p); err != nil {
-		return "", fmt.Errorf("invalid payload_json: %w", err)
+		return EnqueuePayload{}, fmt.Errorf("invalid payload_json: %w", err)
 	}
 	if strings.TrimSpace(p.BatchPath) == "" {
-		return "", fmt.Errorf("batch_path is missing in payload")
+		return EnqueuePayload{}, fmt.Errorf("batch_path is missing in payload")
 	}
-	return p.BatchPath, nil
+	return p, nil
 }
 
 type ingestCatalog struct {
@@ -223,7 +222,7 @@ func postBatchIngestionFailed(ctx context.Context, d *db.DB, batchPath string, c
 	if d == nil {
 		return
 	}
-	ingestionID, _, err := readBatchLeaseInfo(batchPath)
+	batchMeta, err := readBatchLeaseInfo(batchPath)
 	if err != nil {
 		log.Printf("worker ingestion failed missing lease info: %v", err)
 		return
@@ -243,46 +242,27 @@ func postBatchIngestionFailed(ctx context.Context, d *db.DB, batchPath string, c
 		log.Printf("worker ingestion failed marshal error: %v", err)
 		return
 	}
-	ev := db.VPSEvent{
-		EventID:     uuid.NewString(),
-		IngestionID: ingestionID,
-		EventType:   "INGESTION_FAILED",
-		PayloadJSON: string(payloadJSON),
-	}
-	if err := d.EnqueueVPSEvent(ctx, ev); err != nil {
+	if err := d.RecordIngestionItemFailed(ctx, batchMeta.IngestionID, batchMeta.IngestionItemID, uuid.NewString(), string(payloadJSON)); err != nil {
 		log.Printf("worker ingestion failed enqueue error: %v", err)
 		return
 	}
-	if err := d.SetIngestionLeaseState(ctx, ingestionID, "completed"); err != nil {
-		log.Printf("worker ingestion failed set state error: %v", err)
-	}
 }
 
-func postIngestionCompletion(ctx context.Context, d *db.DB, ingestionID, objectID string, ingestManifest any) error {
-	if d == nil || ingestionID == "" {
+func postIngestionItemCompletion(ctx context.Context, d *db.DB, ingestionID, ingestionItemID, objectID string, ingestManifest any) error {
+	if d == nil || ingestionID == "" || ingestionItemID == "" {
 		return nil
 	}
 
 	completedPayload := map[string]any{
-		"step":        "ingest",
-		"object_id":   objectID,
-		"ingest_json": ingestManifest,
+		"step":              "ingest",
+		"ingestion_item_id": ingestionItemID,
+		"object_id":         objectID,
+		"ingest_json":       ingestManifest,
 	}
 	completedJSON, err := json.Marshal(completedPayload)
 	if err != nil {
 		return err
 	}
-	completedEv := db.VPSEvent{
-		EventID:     uuid.NewString(),
-		IngestionID: ingestionID,
-		ObjectID:    sql.NullString{String: objectID, Valid: objectID != ""},
-		EventType:   "INGESTION_COMPLETED",
-		PayloadJSON: string(completedJSON),
-	}
-	if err := d.EnqueueVPSEvent(ctx, completedEv); err != nil {
-		return err
-	}
-
 	createdPayload := map[string]any{
 		"object_id": objectID,
 	}
@@ -290,14 +270,17 @@ func postIngestionCompletion(ctx context.Context, d *db.DB, ingestionID, objectI
 	if err != nil {
 		return err
 	}
-	createdEv := db.VPSEvent{
-		EventID:     uuid.NewString(),
-		IngestionID: ingestionID,
-		ObjectID:    sql.NullString{String: objectID, Valid: objectID != ""},
-		EventType:   "OBJECT_CREATED",
-		PayloadJSON: string(createdJSON),
-	}
-	if err := d.EnqueueVPSEvent(ctx, createdEv); err != nil {
+	if _, err := d.RecordIngestionItemCompleted(
+		ctx,
+		ingestionID,
+		ingestionItemID,
+		objectID,
+		uuid.NewString(),
+		string(completedJSON),
+		uuid.NewString(),
+		string(createdJSON),
+		uuid.NewString(),
+	); err != nil {
 		return err
 	}
 
@@ -305,30 +288,52 @@ func postIngestionCompletion(ctx context.Context, d *db.DB, ingestionID, objectI
 		return err
 	}
 
-	if err := d.SetIngestionLeaseState(ctx, ingestionID, "completed"); err != nil {
-		return err
-	}
-
 	return nil
 }
 
-func readBatchLeaseInfo(batchPath string) (string, string, error) {
+func postIngestionItemProcessing(ctx context.Context, d *db.DB, ingestionID, ingestionItemID string) error {
+	if d == nil || ingestionID == "" || ingestionItemID == "" {
+		return nil
+	}
+	payloadJSON, err := json.Marshal(map[string]any{
+		"step":              "ingest",
+		"ingestion_item_id": ingestionItemID,
+	})
+	if err != nil {
+		return err
+	}
+	return d.RecordIngestionItemProcessing(ctx, ingestionID, ingestionItemID, uuid.NewString(), string(payloadJSON))
+}
+
+type batchLeaseInfo struct {
+	IngestionID     string
+	IngestionItemID string
+	LeaseToken      string
+}
+
+func readBatchLeaseInfo(batchPath string) (batchLeaseInfo, error) {
 	ingestionPath := filepath.Join(batchPath, "INGESTION_ID")
+	itemPath := filepath.Join(batchPath, "INGESTION_ITEM_ID")
 	leasePath := filepath.Join(batchPath, "LEASE_TOKEN")
 	ingestionBytes, err := os.ReadFile(ingestionPath)
 	if err != nil {
-		return "", "", err
+		return batchLeaseInfo{}, err
+	}
+	itemBytes, err := os.ReadFile(itemPath)
+	if err != nil {
+		return batchLeaseInfo{}, err
 	}
 	leaseBytes, err := os.ReadFile(leasePath)
 	if err != nil {
-		return "", "", err
+		return batchLeaseInfo{}, err
 	}
 	ingestionID := strings.TrimSpace(string(ingestionBytes))
+	ingestionItemID := strings.TrimSpace(string(itemBytes))
 	leaseToken := strings.TrimSpace(string(leaseBytes))
-	if ingestionID == "" || leaseToken == "" {
-		return "", "", fmt.Errorf("ingestion id or lease token is empty")
+	if ingestionID == "" || ingestionItemID == "" || leaseToken == "" {
+		return batchLeaseInfo{}, fmt.Errorf("ingestion id, ingestion item id, or lease token is empty")
 	}
-	return ingestionID, leaseToken, nil
+	return batchLeaseInfo{IngestionID: ingestionID, IngestionItemID: ingestionItemID, LeaseToken: leaseToken}, nil
 }
 
 func readBatchErrorFile(batchPath string) (string, error) {
@@ -386,12 +391,13 @@ func detectBatchMedia(batchPath string) (mediaKind, []string, error) {
 		".docx": mediaDocument,
 	}
 	ignored := map[string]struct{}{
-		"catalog.json": {},
-		"DONE":         {},
-		"INGESTION_ID": {},
-		"LEASE_TOKEN":  {},
-		"ENQUEUED":     {},
-		"ERROR":        {},
+		"catalog.json":      {},
+		"DONE":              {},
+		"INGESTION_ID":      {},
+		"INGESTION_ITEM_ID": {},
+		"LEASE_TOKEN":       {},
+		"ENQUEUED":          {},
+		"ERROR":             {},
 	}
 	var kinds []mediaKind
 	var files []string
@@ -506,7 +512,8 @@ func copyMediaFiles(files []string, dstDir, prefix string) ([]fileEntry, error) 
 	return entries, nil
 }
 
-func (w *Worker) processIngest(ctx context.Context, objectID, jobID, batchPath string) error {
+func (w *Worker) processIngest(ctx context.Context, objectID, jobID string, enqueuePayload EnqueuePayload) error {
+	batchPath := enqueuePayload.BatchPath
 	objectRoot, err := w.DB.GetObjectRoot(ctx, objectID)
 
 	if err != nil {
@@ -538,6 +545,22 @@ func (w *Worker) processIngest(ctx context.Context, objectID, jobID, batchPath s
 	if err := w.DB.SetObjectProcessingState(ctx, objectID, "ingesting", true); err != nil {
 		appendBatchError(batchPath, err)
 		return err
+	}
+	batchMeta, err := readBatchLeaseInfo(batchPath)
+	if err != nil {
+		appendBatchError(batchPath, err)
+		return fmt.Errorf("read batch lease info: %w", err)
+	}
+	ingestionID := batchMeta.IngestionID
+	ingestionItemID := batchMeta.IngestionItemID
+	if strings.TrimSpace(enqueuePayload.IngestionID) != "" {
+		ingestionID = enqueuePayload.IngestionID
+	}
+	if strings.TrimSpace(enqueuePayload.IngestionItemID) != "" {
+		ingestionItemID = enqueuePayload.IngestionItemID
+	}
+	if err := postIngestionItemProcessing(ctx, w.DB, ingestionID, ingestionItemID); err != nil {
+		log.Printf("worker processIngest post processing event failed: %v", err)
 	}
 	if err := w.DB.AddJobEvent(ctx, jobID, objectID, "info", "ingest started"); err != nil {
 		log.Printf("worker processIngest AddJobEvent failed: %v", err)
@@ -635,13 +658,7 @@ func (w *Worker) processIngest(ctx context.Context, objectID, jobID, batchPath s
 		return err
 	}
 
-	ingestionID, _, err := readBatchLeaseInfo(batchPath)
-	if err != nil {
-		appendBatchError(batchPath, err)
-		return fmt.Errorf("read batch lease info: %w", err)
-	}
-
-	if err := postIngestionCompletion(ctx, w.DB, ingestionID, objectID, manifest); err != nil {
+	if err := postIngestionItemCompletion(ctx, w.DB, ingestionID, ingestionItemID, objectID, manifest); err != nil {
 		appendBatchError(batchPath, err)
 		return fmt.Errorf("post ingestion completion: %w", err)
 	}

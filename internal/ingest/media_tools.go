@@ -23,6 +23,11 @@ type DocumentProcessor interface {
 	Name() string
 }
 
+type SearchablePDFProcessor interface {
+	AddTextLayer(ctx context.Context, src, dst, lang string) error
+	Name() string
+}
+
 func NewAudioProcessor() (AudioProcessor, error) {
 	path, err := exec.LookPath("ffmpeg")
 	if err != nil {
@@ -45,6 +50,14 @@ func NewDocumentProcessor() (DocumentProcessor, error) {
 		return nil, fmt.Errorf("soffice not found in PATH")
 	}
 	return &sofficeProcessor{path: path}, nil
+}
+
+func NewSearchablePDFProcessor() (SearchablePDFProcessor, error) {
+	path, err := exec.LookPath("ocrmypdf")
+	if err != nil {
+		return nil, fmt.Errorf("ocrmypdf not found in PATH")
+	}
+	return &ocrmypdfProcessor{path: path}, nil
 }
 
 type ffmpegAudioProcessor struct {
@@ -83,6 +96,10 @@ type sofficeProcessor struct {
 	path string
 }
 
+type ocrmypdfProcessor struct {
+	path string
+}
+
 func (p *sofficeProcessor) Name() string {
 	return "soffice"
 }
@@ -100,6 +117,31 @@ func (p *sofficeProcessor) ToPDF(ctx context.Context, src, dst string) error {
 	}
 	if _, err := copyFileAtomic(converted, dst); err != nil {
 		return err
+	}
+	return nil
+}
+
+func (p *ocrmypdfProcessor) Name() string {
+	return "ocrmypdf"
+}
+
+func (p *ocrmypdfProcessor) AddTextLayer(ctx context.Context, src, dst, lang string) error {
+	args := []string{
+		"--rotate-pages",
+		"--deskew",
+		"--clean",
+		"--clean-final",
+		"--oversample", "300",
+		"--optimize", "1",
+		"--output-type", "pdfa",
+	}
+	if strings.TrimSpace(lang) != "" {
+		args = append(args, "-l", strings.TrimSpace(lang))
+	}
+	args = append(args, src, dst)
+	cmd := exec.CommandContext(ctx, p.path, args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("ocrmypdf failed: %s", commandError(out, err))
 	}
 	return nil
 }

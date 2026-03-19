@@ -69,7 +69,9 @@ func (w *Watcher) Walker(ctx context.Context, path string, de os.DirEntry, err e
 
 	// Insert ingest job
 	jobID := "JOB-" + objectID // v1; later: UUID
-	payloadBytes, err := json.Marshal(EnqueuePayload{BatchPath: path})
+	ingestionID, _ := readMarkerValue(filepath.Join(path, "INGESTION_ID"))
+	ingestionItemID, _ := readMarkerValue(filepath.Join(path, "INGESTION_ITEM_ID"))
+	payloadBytes, err := json.Marshal(EnqueuePayload{BatchPath: path, IngestionID: ingestionID, IngestionItemID: ingestionItemID})
 	if err != nil {
 		return err
 	}
@@ -133,4 +135,12 @@ func listImageFiles(dir string) ([]string, error) {
 
 	sort.Strings(files)
 	return files, nil
+}
+
+func readMarkerValue(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
 }

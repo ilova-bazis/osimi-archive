@@ -8,17 +8,18 @@ import (
 )
 
 type VPSEvent struct {
-	EventID       string
-	IngestionID   string
-	ObjectID      sql.NullString
-	EventType     string
-	PayloadJSON   string
-	CreatedAt     string
-	Attempts      int
-	NextAttemptAt sql.NullString
-	State         string
-	LastError     sql.NullString
-	SentAt        sql.NullString
+	EventID         string
+	IngestionID     string
+	IngestionItemID sql.NullString
+	ObjectID        sql.NullString
+	EventType       string
+	PayloadJSON     string
+	CreatedAt       string
+	Attempts        int
+	NextAttemptAt   sql.NullString
+	State           string
+	LastError       sql.NullString
+	SentAt          sql.NullString
 }
 
 func (d *DB) UpsertIngestionLease(ctx context.Context, ingestionID, leaseID, leaseToken, leaseExpiresAt string) error {
@@ -69,9 +70,9 @@ func (d *DB) EnqueueVPSEvent(ctx context.Context, ev VPSEvent) error {
 		ev.NextAttemptAt = sql.NullString{String: now, Valid: true}
 	}
 	_, err := d.ExecContext(ctx, `
-		INSERT INTO vps_events (event_id, ingestion_id, object_id, event_type, payload_json, created_at, attempts, next_attempt_at, state)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-	`, ev.EventID, ev.IngestionID, ev.ObjectID, ev.EventType, ev.PayloadJSON, ev.CreatedAt, ev.Attempts, ev.NextAttemptAt)
+		INSERT INTO vps_events (event_id, ingestion_id, ingestion_item_id, object_id, event_type, payload_json, created_at, attempts, next_attempt_at, state)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+	`, ev.EventID, ev.IngestionID, ev.IngestionItemID, ev.ObjectID, ev.EventType, ev.PayloadJSON, ev.CreatedAt, ev.Attempts, ev.NextAttemptAt)
 	if err != nil {
 		log.Printf("db EnqueueVPSEvent failed: %v", err)
 	}
@@ -80,7 +81,7 @@ func (d *DB) EnqueueVPSEvent(ctx context.Context, ev VPSEvent) error {
 
 func (d *DB) FetchPendingVPSEvents(ctx context.Context, limit int) ([]VPSEvent, error) {
 	rows, err := d.QueryContext(ctx, `
-		SELECT event_id, ingestion_id, object_id, event_type, payload_json, created_at, attempts, next_attempt_at, state, last_error, sent_at
+		SELECT event_id, ingestion_id, ingestion_item_id, object_id, event_type, payload_json, created_at, attempts, next_attempt_at, state, last_error, sent_at
 		FROM vps_events
 		WHERE state = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
 		ORDER BY created_at ASC
@@ -95,7 +96,7 @@ func (d *DB) FetchPendingVPSEvents(ctx context.Context, limit int) ([]VPSEvent, 
 	var events []VPSEvent
 	for rows.Next() {
 		var ev VPSEvent
-		if err := rows.Scan(&ev.EventID, &ev.IngestionID, &ev.ObjectID, &ev.EventType, &ev.PayloadJSON, &ev.CreatedAt, &ev.Attempts, &ev.NextAttemptAt, &ev.State, &ev.LastError, &ev.SentAt); err != nil {
+		if err := rows.Scan(&ev.EventID, &ev.IngestionID, &ev.IngestionItemID, &ev.ObjectID, &ev.EventType, &ev.PayloadJSON, &ev.CreatedAt, &ev.Attempts, &ev.NextAttemptAt, &ev.State, &ev.LastError, &ev.SentAt); err != nil {
 			log.Printf("db FetchPendingVPSEvents scan failed: %v", err)
 			continue
 		}

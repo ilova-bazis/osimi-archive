@@ -201,9 +201,35 @@ CREATE TABLE IF NOT EXISTS ingestion_lease_tokens (
    updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS ingestion_runs (
+    ingestion_id TEXT PRIMARY KEY,
+    lease_id TEXT NOT NULL,
+    expected_items INTEGER NOT NULL CHECK (expected_items >= 0),
+    terminal_items INTEGER NOT NULL DEFAULT 0 CHECK (terminal_items >= 0),
+    succeeded_items INTEGER NOT NULL DEFAULT 0 CHECK (succeeded_items >= 0),
+    failed_items INTEGER NOT NULL DEFAULT 0 CHECK (failed_items >= 0),
+    aggregate_emitted INTEGER NOT NULL DEFAULT 0 CHECK (aggregate_emitted IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ingestion_run_items (
+    ingestion_id TEXT NOT NULL,
+    ingestion_item_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'processing', 'completed', 'failed')),
+    object_id TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (ingestion_id, ingestion_item_id),
+    FOREIGN KEY (ingestion_id) REFERENCES ingestion_runs (ingestion_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_ingestion_run_items_state
+    ON ingestion_run_items (ingestion_id, state, updated_at);
+
 CREATE TABLE IF NOT EXISTS vps_events (
     event_id TEXT PRIMARY KEY,
     ingestion_id TEXT NOT NULL,
+    ingestion_item_id TEXT,
     object_id TEXT,
     event_type TEXT NOT NULL,
     payload_json TEXT NOT NULL,

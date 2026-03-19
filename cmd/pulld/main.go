@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -15,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -28,25 +28,51 @@ import (
 )
 
 type leaseState struct {
-	mu          sync.RWMutex
-	leaseToken  string
-	catalogJSON json.RawMessage
+	mu         sync.RWMutex
+	leaseToken string
 }
 
 var errDropNotFound = errors.New("drop not found")
 
 const availableFilesSnapshotAction = "available_files_snapshot"
+const objectResyncAction = "object_resync"
+
+var archiveSleepWithContext = sleepWithContext
+var archiveJitterDuration = jitterDuration
+var newArchiveHeartbeatTicker = time.NewTicker
+
+type archiveRequestDB interface {
+	GetObjectRoot(ctx context.Context, objectID string) (string, error)
+}
+
+type archiveRequestClient interface {
+	LeaseArchiveRequest(ctx context.Context, actionType string) (*vps.ArchiveRequest, error)
+	HeartbeatArchiveRequest(ctx context.Context, requestID, leaseToken string) (*vps.ArchiveRequest, error)
+	ReleaseArchiveRequest(ctx context.Context, requestID, leaseToken string) error
+	CompleteArchiveRequest(ctx context.Context, requestID, leaseToken string) error
+	FailArchiveRequest(ctx context.Context, requestID, leaseToken string, payload vps.ArchiveRequestFailPayload) error
+	PutAvailableFiles(ctx context.Context, objectID string, files []vps.AvailableFile) error
+}
+
+var newDownloadHeartbeatTicker = time.NewTicker
+
+type downloadRequestDB interface {
+	GetObjectRoot(ctx context.Context, objectID string) (string, error)
+}
+
+type downloadRequestClient interface {
+	HeartbeatDownloadRequest(ctx context.Context, requestID, leaseToken string) (*vps.DownloadRequest, error)
+	ReleaseDownloadRequest(ctx context.Context, requestID, leaseToken string) error
+	PresignDownloadArtifact(ctx context.Context, requestID, leaseToken string, req vps.DownloadPresignRequest) (*vps.DownloadArtifactPresignResponse, error)
+	UploadDownloadRequestArtifact(ctx context.Context, uploadPath, contentType string, sizeBytes int64, headers vps.DownloadArtifactPresignHeaders, body io.Reader) error
+	CompleteDownloadRequest(ctx context.Context, requestID, leaseToken, uploadToken string) error
+	FailDownloadRequest(ctx context.Context, requestID, leaseToken string, payload vps.DownloadFailPayload) error
+}
 
 func (s *leaseState) Token() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.leaseToken
-}
-
-func (s *leaseState) CatalogJSON() json.RawMessage {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.catalogJSON
 }
 
 func (s *leaseState) UpdateFromLease(lease *vps.Lease) {
@@ -57,9 +83,6 @@ func (s *leaseState) UpdateFromLease(lease *vps.Lease) {
 	defer s.mu.Unlock()
 	if strings.TrimSpace(lease.LeaseToken) != "" {
 		s.leaseToken = lease.LeaseToken
-	}
-	if len(lease.CatalogJSON) > 0 {
-		s.catalogJSON = lease.CatalogJSON
 	}
 }
 
@@ -73,6 +96,11 @@ type downloadRequestLeaseState struct {
 	leaseToken string
 }
 
+type archiveRequestLeaseState struct {
+	mu         sync.RWMutex
+	leaseToken string
+}
+
 func (s *downloadRequestLeaseState) Token() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -80,6 +108,25 @@ func (s *downloadRequestLeaseState) Token() string {
 }
 
 func (s *downloadRequestLeaseState) Update(req *vps.DownloadRequest) {
+	if req == nil {
+		return
+	}
+	token := strings.TrimSpace(req.LeaseToken)
+	if token == "" {
+		return
+	}
+	s.mu.Lock()
+	s.leaseToken = token
+	s.mu.Unlock()
+}
+
+func (s *archiveRequestLeaseState) Token() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.leaseToken
+}
+
+func (s *archiveRequestLeaseState) Update(req *vps.ArchiveRequest) {
 	if req == nil {
 		return
 	}
@@ -121,6 +168,7 @@ func main() {
 	go notifierLoop(ctx, d, client, cfg)
 	go backendObjectTasksLoop(ctx, d, client, cfg)
 	go downloadRequestsLoop(ctx, d, client, cfg)
+	go archiveRequestsLoop(ctx, d, client, cfg)
 
 	pollTicker := time.NewTicker(cfg.LeasePollInterval)
 	defer pollTicker.Stop()
@@ -149,8 +197,8 @@ func main() {
 				continue
 			}
 			if cfg.Verbose {
-				log.Printf("[VERBOSE] lease acquired: ingestion_id=%s batch_label=%s tenant_id=%s lease_expires_at=%s file_count=%d",
-					lease.IngestionID, lease.BatchLabel, lease.TenantID, lease.LeaseExpiresAt, len(lease.DownloadURLs))
+				log.Printf("[VERBOSE] lease acquired: ingestion_id=%s batch_label=%s tenant_id=%s lease_expires_at=%s item_count=%d file_count=%d",
+					lease.IngestionID, lease.BatchLabel, lease.TenantID, lease.LeaseExpiresAt, len(lease.Items), countLeaseFiles(lease.Items))
 			}
 			if err := handleLease(ctx, d, cfg, client, lease); err != nil {
 				log.Printf("lease handling failed: %v", err)
@@ -160,7 +208,7 @@ func main() {
 }
 
 func handleLease(ctx context.Context, d *db.DB, cfg config.Config, client *vps.Client, lease *vps.Lease) error {
-	state := &leaseState{leaseToken: lease.LeaseToken, catalogJSON: lease.CatalogJSON}
+	state := &leaseState{leaseToken: lease.LeaseToken}
 
 	if err := d.UpsertIngestionLease(ctx, lease.IngestionID, lease.LeaseID, lease.LeaseToken, lease.LeaseExpiresAt); err != nil {
 		log.Printf("failed to upsert lease: %v", err)
@@ -168,15 +216,9 @@ func handleLease(ctx context.Context, d *db.DB, cfg config.Config, client *vps.C
 
 	if cfg.Verbose {
 		log.Printf("[VERBOSE] handling lease for ingestion_id=%s", lease.IngestionID)
-		if len(lease.CatalogJSON) > 0 {
-			var prettyJSON bytes.Buffer
-			if err := json.Indent(&prettyJSON, lease.CatalogJSON, "", "  "); err == nil {
-				log.Printf("[VERBOSE] catalog_json:\n%s", prettyJSON.String())
-			} else {
-				log.Printf("[VERBOSE] catalog_json (raw): %s", string(lease.CatalogJSON))
-			}
-		} else {
-			log.Println("[VERBOSE] catalog_json is empty")
+		for _, item := range lease.Items {
+			log.Printf("[VERBOSE] lease item: ingestion_item_id=%s item_index=%d file_count=%d",
+				item.IngestionItemID, item.ItemIndex, len(item.Files))
 		}
 	}
 
@@ -215,6 +257,10 @@ func handleLease(ctx context.Context, d *db.DB, cfg config.Config, client *vps.C
 		postFailure(ctx, d, lease.IngestionID, "drop_path_error", err)
 		return err
 	}
+	if err := d.SeedIngestionRun(ctx, lease.IngestionID, lease.LeaseID, leaseItemIDs(lease.Items)); err != nil {
+		postFailure(ctx, d, lease.IngestionID, "ingestion_run_seed_failed", err)
+		return err
+	}
 	cleanup := true
 	defer func() {
 		if cleanup {
@@ -222,39 +268,9 @@ func handleLease(ctx context.Context, d *db.DB, cfg config.Config, client *vps.C
 		}
 	}()
 
-	downloads, checksumPath, err := downloadBatch(ctx, cfg, client, lease, tmpDir)
-	if err != nil {
+	if err := downloadBatch(ctx, cfg, client, lease, tmpDir, state.Token(), cfg.DoneMarker); err != nil {
 		postFailure(ctx, d, lease.IngestionID, "download_failed", err)
 		return err
-	}
-
-	if err := writeCatalog(tmpDir, state.CatalogJSON()); err != nil {
-		postFailure(ctx, d, lease.IngestionID, "catalog_write_failed", err)
-		return err
-	}
-	if cfg.Verbose {
-		log.Printf("[VERBOSE] catalog.json written to %s", tmpDir)
-	}
-
-	if checksumPath != "" {
-		expected, err := parseChecksumFile(checksumPath)
-		if err != nil {
-			postFailure(ctx, d, lease.IngestionID, "checksum_parse_failed", err)
-			return err
-		}
-		if cfg.Verbose {
-			log.Printf("[VERBOSE] verifying %d checksums from %s", len(expected), checksumPath)
-		}
-		if err := verifyChecksums(downloads, expected); err != nil {
-			postFailure(ctx, d, lease.IngestionID, "checksum_mismatch", err)
-			return err
-		}
-		if cfg.Verbose {
-			log.Println("[VERBOSE] checksums verified successfully")
-		}
-		if err := os.Remove(checksumPath); err != nil {
-			log.Printf("checksum cleanup failed: %v", err)
-		}
 	}
 
 	if err := os.Rename(tmpDir, finalDir); err != nil {
@@ -265,20 +281,7 @@ func handleLease(ctx context.Context, d *db.DB, cfg config.Config, client *vps.C
 		log.Printf("[VERBOSE] drop finalized: %s", finalDir)
 	}
 	cleanup = false
-	if err := writeLeaseMetadata(finalDir, lease.IngestionID, state.Token()); err != nil {
-		postFailure(ctx, d, lease.IngestionID, "lease_metadata_failed", err)
-		return err
-	}
-	if cfg.Verbose {
-		log.Println("[VERBOSE] lease metadata written")
-	}
-	if err := os.WriteFile(filepath.Join(finalDir, cfg.DoneMarker), []byte("ok\n"), 0644); err != nil {
-		postFailure(ctx, d, lease.IngestionID, "done_marker_failed", err)
-		return err
-	}
-	if cfg.Verbose {
-		log.Printf("[VERBOSE] done marker written: %s", cfg.DoneMarker)
-	}
+
 	if err := postIngestionProcessing(ctx, d, lease.IngestionID); err != nil {
 		log.Printf("post processing event failed: %v", err)
 	}
@@ -290,6 +293,169 @@ func handleLease(ctx context.Context, d *db.DB, cfg config.Config, client *vps.C
 	released = true
 	if cfg.Verbose {
 		log.Printf("[VERBOSE] handoff complete for ingestion_id=%s; lease retained for ingest worker completion", lease.IngestionID)
+	}
+	return nil
+}
+
+func countLeaseFiles(items []vps.LeaseItem) int {
+	total := 0
+	for _, item := range items {
+		total += len(item.Files)
+	}
+	return total
+}
+
+func leaseItemIDs(items []vps.LeaseItem) []string {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.IngestionItemID)
+	}
+	return ids
+}
+
+func buildItemDirName(item vps.LeaseItem) string {
+	label := fmt.Sprintf("item_%03d", item.ItemIndex)
+	if strings.TrimSpace(item.IngestionItemID) != "" {
+		label += "__ITEM-" + sanitizeName(item.IngestionItemID)
+	}
+	return label
+}
+
+func itemBatchReady(dir string, doneMarker string) bool {
+	if _, err := os.Stat(filepath.Join(dir, doneMarker)); err == nil {
+		return true
+	}
+	if _, err := os.Stat(filepath.Join(dir, "ENQUEUED")); err == nil {
+		return true
+	}
+	return strings.Contains(filepath.Base(dir), "__IMPORTED__")
+}
+
+func itemBatchFailed(dir string) (string, bool) {
+	content, err := readErrorFile(filepath.Join(dir, "ERROR"))
+	if err != nil {
+		return "", false
+	}
+	return content, true
+}
+
+func handleExistingDrop(ctx context.Context, d *db.DB, ingestionID, finalDir string) error {
+	info, err := os.Stat(finalDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return errDropNotFound
+		}
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("drop path exists but is not a directory: %s", finalDir)
+	}
+
+	entries, err := os.ReadDir(finalDir)
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		if err := os.RemoveAll(finalDir); err != nil {
+			return fmt.Errorf("cleanup incomplete drop: %w", err)
+		}
+		return errDropNotFound
+	}
+
+	hasReadyBatch := false
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(finalDir, entry.Name())
+		if content, ok := itemBatchFailed(path); ok {
+			if postErr := postIngestionFailed(ctx, d, ingestionID, content); postErr != nil {
+				return postErr
+			}
+			return nil
+		}
+		if itemBatchReady(path, "DONE") {
+			hasReadyBatch = true
+		}
+	}
+	if !hasReadyBatch {
+		if err := os.RemoveAll(finalDir); err != nil {
+			return fmt.Errorf("cleanup incomplete drop: %w", err)
+		}
+		return errDropNotFound
+	}
+
+	if err := postIngestionProcessing(ctx, d, ingestionID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func downloadBatch(ctx context.Context, cfg config.Config, client *vps.Client, lease *vps.Lease, dstDir, leaseToken, doneMarker string) error {
+	if len(lease.Items) == 0 {
+		return fmt.Errorf("lease contains no items to ingest")
+	}
+	if cfg.Verbose {
+		log.Printf("[VERBOSE] materializing %d items to %s", len(lease.Items), dstDir)
+	}
+
+	for _, item := range lease.Items {
+		if strings.TrimSpace(item.IngestionItemID) == "" {
+			return fmt.Errorf("lease item missing ingestion_item_id")
+		}
+		if len(item.Files) == 0 {
+			return fmt.Errorf("lease item %s contains no files", item.IngestionItemID)
+		}
+
+		itemDir := filepath.Join(dstDir, buildItemDirName(item))
+		if err := os.MkdirAll(itemDir, 0755); err != nil {
+			return err
+		}
+		if err := writeCatalog(itemDir, item.CatalogJSON); err != nil {
+			return err
+		}
+		if err := writeLeaseMetadata(itemDir, lease.IngestionID, item.IngestionItemID, leaseToken); err != nil {
+			return err
+		}
+
+		usedNames := map[string]int{}
+		for i, file := range item.Files {
+			expectedChecksum, err := normalizeSHA256(file.ChecksumSHA256)
+			if err != nil {
+				return fmt.Errorf("invalid checksum for item=%s file_id=%s storage_key=%s: %w", item.IngestionItemID, file.FileID, file.StorageKey, err)
+			}
+
+			ext := strings.ToLower(filepath.Ext(file.Filename))
+			if ext == "" {
+				ext = strings.ToLower(filepath.Ext(file.StorageKey))
+			}
+			name := fmt.Sprintf("file_%04d-original%s", i+1, ext)
+			if count := usedNames[name]; count > 0 {
+				name = fmt.Sprintf("file_%04d-original_%d%s", i+1, count+1, ext)
+			}
+			usedNames[name]++
+
+			if cfg.Verbose {
+				log.Printf("[VERBOSE] download item=%s file_id=%s filename=%s sort_order=%d",
+					item.IngestionItemID, file.FileID, file.Filename, file.SortOrder)
+			}
+
+			path := filepath.Join(itemDir, name)
+			if err := downloadToFile(ctx, client, file.DownloadURL, path); err != nil {
+				return err
+			}
+			actualChecksum, err := sha256File(path)
+			if err != nil {
+				return err
+			}
+			if !strings.EqualFold(actualChecksum, expectedChecksum) {
+				return fmt.Errorf("checksum mismatch for item=%s file_id=%s storage_key=%s: expected=%s actual=%s", item.IngestionItemID, file.FileID, file.StorageKey, expectedChecksum, actualChecksum)
+			}
+		}
+
+		if err := os.WriteFile(filepath.Join(itemDir, doneMarker), []byte("ok\n"), 0644); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -345,102 +511,6 @@ func buildDropPaths(ingestDrop string, lease *vps.Lease) (string, string, error)
 	return tmpDir, finalDir, nil
 }
 
-func handleExistingDrop(ctx context.Context, d *db.DB, ingestionID, finalDir string) error {
-	info, err := os.Stat(finalDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return errDropNotFound
-		}
-		return err
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("drop path exists but is not a directory: %s", finalDir)
-	}
-
-	donePath := filepath.Join(finalDir, "DONE")
-	if _, err := os.Stat(donePath); err != nil {
-		if os.IsNotExist(err) {
-			if err := os.RemoveAll(finalDir); err != nil {
-				return fmt.Errorf("cleanup incomplete drop: %w", err)
-			}
-			return errDropNotFound
-		}
-		return err
-	}
-
-	errorPath := filepath.Join(finalDir, "ERROR")
-	if _, err := os.Stat(errorPath); err == nil {
-		content, readErr := readErrorFile(errorPath)
-		if readErr != nil {
-			content = fmt.Sprintf("failed to read ERROR file: %v", readErr)
-		}
-		if postErr := postIngestionFailed(ctx, d, ingestionID, content); postErr != nil {
-			return postErr
-		}
-		return nil
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-
-	if err := postIngestionProcessing(ctx, d, ingestionID); err != nil {
-		return err
-	}
-	return nil
-}
-
-func downloadBatch(ctx context.Context, cfg config.Config, client *vps.Client, lease *vps.Lease, dstDir string) ([]downloadItem, string, error) {
-	var items []downloadItem
-	checksumPath := ""
-	usedNames := map[string]int{}
-
-	if cfg.Verbose {
-		log.Printf("[VERBOSE] downloading %d files to %s", len(lease.DownloadURLs), dstDir)
-	}
-
-	for _, url := range lease.DownloadURLs {
-		name := filepath.Base(url.StorageKey)
-		if name == "." || name == string(filepath.Separator) || name == "" {
-			name = url.FileID
-		}
-		if count := usedNames[name]; count > 0 {
-			name = fmt.Sprintf("%s_%d", name, count+1)
-		}
-		usedNames[name]++
-
-		if cfg.Verbose {
-			log.Printf("[VERBOSE] download: file_id=%s storage_key=%s content_type=%s size_bytes=%d",
-				url.FileID, url.StorageKey, url.ContentType, url.SizeBytes)
-		}
-
-		if isChecksumFile(name, url.ContentType) {
-			path := filepath.Join(dstDir, name)
-			if err := downloadToFile(ctx, client, url.DownloadURL, path); err != nil {
-				return nil, "", err
-			}
-			checksumPath = path
-			if cfg.Verbose {
-				log.Printf("[VERBOSE] checksum file detected: %s", name)
-			}
-			continue
-		}
-		path := filepath.Join(dstDir, name)
-		if err := downloadToFile(ctx, client, url.DownloadURL, path); err != nil {
-			return nil, "", err
-		}
-		items = append(items, downloadItem{FileName: name, Path: path})
-		if cfg.Verbose {
-			log.Printf("[VERBOSE] downloaded: %s -> %s", name, path)
-		}
-	}
-	if len(items) == 0 {
-		return nil, checksumPath, fmt.Errorf("lease contains no files to ingest")
-	}
-	if cfg.Verbose {
-		log.Printf("[VERBOSE] download complete: %d files, checksum_path=%s", len(items), checksumPath)
-	}
-	return items, checksumPath, nil
-}
-
 func downloadToFile(ctx context.Context, client *vps.Client, downloadURL, dst string) error {
 	resp, err := client.Download(ctx, downloadURL)
 	if err != nil {
@@ -485,14 +555,20 @@ func writeCatalog(dstDir string, catalog json.RawMessage) error {
 	return os.WriteFile(filepath.Join(dstDir, "catalog.json"), data, 0644)
 }
 
-func writeLeaseMetadata(dstDir, ingestionID, leaseToken string) error {
+func writeLeaseMetadata(dstDir, ingestionID, ingestionItemID, leaseToken string) error {
 	if strings.TrimSpace(ingestionID) == "" {
 		return fmt.Errorf("missing ingestion id")
+	}
+	if strings.TrimSpace(ingestionItemID) == "" {
+		return fmt.Errorf("missing ingestion item id")
 	}
 	if strings.TrimSpace(leaseToken) == "" {
 		return fmt.Errorf("missing lease token")
 	}
 	if err := os.WriteFile(filepath.Join(dstDir, "INGESTION_ID"), []byte(ingestionID+"\n"), 0644); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(dstDir, "INGESTION_ITEM_ID"), []byte(ingestionItemID+"\n"), 0644); err != nil {
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(dstDir, "LEASE_TOKEN"), []byte(leaseToken+"\n"), 0600); err != nil {
@@ -569,6 +645,20 @@ func isChecksumFile(name, contentType string) bool {
 		return true
 	}
 	return strings.HasPrefix(contentType, "text/") && strings.Contains(name, "checksum")
+}
+
+func normalizeSHA256(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", fmt.Errorf("missing checksum_sha256")
+	}
+	if len(value) != 64 {
+		return "", fmt.Errorf("checksum_sha256 must be 64 hex chars")
+	}
+	if _, err := hex.DecodeString(value); err != nil {
+		return "", fmt.Errorf("checksum_sha256 must be hex")
+	}
+	return strings.ToLower(value), nil
 }
 
 func sanitizeName(name string) string {
@@ -758,7 +848,47 @@ func downloadRequestsLoop(ctx context.Context, d *db.DB, client *vps.Client, cfg
 	}
 }
 
-func processDownloadRequest(ctx context.Context, d *db.DB, cfg config.Config, client *vps.Client, req *vps.DownloadRequest) error {
+func archiveRequestsLoop(ctx context.Context, d archiveRequestDB, client archiveRequestClient, cfg config.Config) {
+	log.Println("archive requests loop started")
+
+	errorSleep := cfg.ArchiveRequestPollInterval
+	if errorSleep <= 0 {
+		errorSleep = 5 * time.Second
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("archive requests loop stopped")
+			return
+		default:
+		}
+
+		req, err := client.LeaseArchiveRequest(ctx, objectResyncAction)
+		if err != nil {
+			log.Printf("lease archive request failed: %v", err)
+			if !archiveSleepWithContext(ctx, errorSleep) {
+				log.Println("archive requests loop stopped")
+				return
+			}
+			continue
+		}
+
+		if req == nil {
+			if !archiveSleepWithContext(ctx, archiveJitterDuration(2*time.Second, 10*time.Second)) {
+				log.Println("archive requests loop stopped")
+				return
+			}
+			continue
+		}
+
+		if err := processArchiveRequest(ctx, d, cfg, client, req); err != nil {
+			log.Printf("process archive request failed: %v", err)
+		}
+	}
+}
+
+func processDownloadRequest(ctx context.Context, d downloadRequestDB, cfg config.Config, client downloadRequestClient, req *vps.DownloadRequest) error {
 	if req == nil {
 		return nil
 	}
@@ -779,7 +909,7 @@ func processDownloadRequest(ctx context.Context, d *db.DB, cfg config.Config, cl
 		if token == "" {
 			return
 		}
-		if err := client.ReleaseDownloadRequest(ctx, requestID, token); err != nil {
+		if err := client.ReleaseDownloadRequest(ctx, requestID, token); err != nil && !isHTTPStatus(err, 409) {
 			log.Printf("release download request failed: request_id=%s err=%v", requestID, err)
 		}
 	}()
@@ -883,6 +1013,10 @@ func processDownloadRequest(ctx context.Context, d *db.DB, cfg config.Config, cl
 	}
 
 	if err := client.CompleteDownloadRequest(ctx, requestID, state.Token(), presign.UploadToken); err != nil {
+		if isHTTPStatus(err, 409) {
+			completed = true
+			return nil
+		}
 		return failDownloadRequest(ctx, client, requestID, state.Token(), vps.DownloadFailPayload{
 			Code:      "COMPLETE_FAILED",
 			Message:   err.Error(),
@@ -897,11 +1031,11 @@ func processDownloadRequest(ctx context.Context, d *db.DB, cfg config.Config, cl
 	return nil
 }
 
-func downloadRequestHeartbeatLoop(ctx context.Context, cfg config.Config, client *vps.Client, requestID string, state *downloadRequestLeaseState) {
+func downloadRequestHeartbeatLoop(ctx context.Context, cfg config.Config, client downloadRequestClient, requestID string, state *downloadRequestLeaseState) {
 	if cfg.DownloadRequestHeartbeatInterval <= 0 {
 		return
 	}
-	ticker := time.NewTicker(cfg.DownloadRequestHeartbeatInterval)
+	ticker := newDownloadHeartbeatTicker(cfg.DownloadRequestHeartbeatInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -910,7 +1044,9 @@ func downloadRequestHeartbeatLoop(ctx context.Context, cfg config.Config, client
 		case <-ticker.C:
 			req, err := client.HeartbeatDownloadRequest(ctx, requestID, state.Token())
 			if err != nil {
-				log.Printf("download request heartbeat failed: request_id=%s err=%v", requestID, err)
+				if !isHTTPStatus(err, 409) {
+					log.Printf("download request heartbeat failed: request_id=%s err=%v", requestID, err)
+				}
 				continue
 			}
 			state.Update(req)
@@ -918,11 +1054,133 @@ func downloadRequestHeartbeatLoop(ctx context.Context, cfg config.Config, client
 	}
 }
 
-func failDownloadRequest(ctx context.Context, client *vps.Client, requestID, leaseToken string, payload vps.DownloadFailPayload) error {
+func failDownloadRequest(ctx context.Context, client downloadRequestClient, requestID, leaseToken string, payload vps.DownloadFailPayload) error {
 	if err := client.FailDownloadRequest(ctx, requestID, leaseToken, payload); err != nil {
+		if isHTTPStatus(err, 409) {
+			return nil
+		}
 		return fmt.Errorf("report download request failure failed: %w", err)
 	}
 	return fmt.Errorf("download request %s failed: %s", requestID, payload.Message)
+}
+
+func processArchiveRequest(ctx context.Context, d archiveRequestDB, cfg config.Config, client archiveRequestClient, req *vps.ArchiveRequest) error {
+	if req == nil {
+		return nil
+	}
+	requestID := strings.TrimSpace(req.EffectiveRequestID())
+	if requestID == "" {
+		return fmt.Errorf("archive request missing id")
+	}
+	if strings.TrimSpace(req.TargetID) == "" {
+		return fmt.Errorf("archive request %s missing target_id", requestID)
+	}
+
+	state := &archiveRequestLeaseState{leaseToken: req.LeaseToken}
+	completed := false
+	defer func() {
+		if completed {
+			return
+		}
+		token := state.Token()
+		if token == "" {
+			return
+		}
+		if err := client.ReleaseArchiveRequest(ctx, requestID, token); err != nil && !isHTTPStatus(err, 409) {
+			log.Printf("release archive request failed: request_id=%s err=%v", requestID, err)
+		}
+	}()
+
+	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
+	defer cancelHeartbeat()
+	go archiveRequestHeartbeatLoop(heartbeatCtx, cfg, client, requestID, state)
+
+	actionType := strings.TrimSpace(req.ActionType)
+	switch actionType {
+	case objectResyncAction:
+		objectRoot, err := d.GetObjectRoot(ctx, req.TargetID)
+		if err != nil {
+			return failArchiveRequest(ctx, client, requestID, state.Token(), vps.ArchiveRequestFailPayload{
+				Code:      "OBJECT_NOT_FOUND",
+				Message:   err.Error(),
+				Retryable: false,
+			})
+		}
+
+		files, err := buildAvailableFilesSnapshot(req.TargetID, objectRoot, cfg.PublishOriginalsAvailableFiles)
+		if err != nil {
+			return failArchiveRequest(ctx, client, requestID, state.Token(), vps.ArchiveRequestFailPayload{
+				Code:      "SNAPSHOT_BUILD_FAILED",
+				Message:   err.Error(),
+				Retryable: true,
+			})
+		}
+
+		if err := client.PutAvailableFiles(ctx, req.TargetID, files); err != nil {
+			return failArchiveRequest(ctx, client, requestID, state.Token(), vps.ArchiveRequestFailPayload{
+				Code:      "SNAPSHOT_SYNC_FAILED",
+				Message:   err.Error(),
+				Retryable: true,
+			})
+		}
+	default:
+		return failArchiveRequest(ctx, client, requestID, state.Token(), vps.ArchiveRequestFailPayload{
+			Code:      "UNSUPPORTED_ACTION",
+			Message:   fmt.Sprintf("unsupported action_type: %s", actionType),
+			Retryable: false,
+		})
+	}
+
+	if err := client.CompleteArchiveRequest(ctx, requestID, state.Token()); err != nil {
+		if isHTTPStatus(err, 409) {
+			completed = true
+			return nil
+		}
+		return failArchiveRequest(ctx, client, requestID, state.Token(), vps.ArchiveRequestFailPayload{
+			Code:      "COMPLETE_FAILED",
+			Message:   err.Error(),
+			Retryable: true,
+		})
+	}
+
+	completed = true
+	if cfg.Verbose {
+		log.Printf("[VERBOSE] archive request completed: request_id=%s target_id=%s action_type=%s", requestID, req.TargetID, actionType)
+	}
+	return nil
+}
+
+func archiveRequestHeartbeatLoop(ctx context.Context, cfg config.Config, client archiveRequestClient, requestID string, state *archiveRequestLeaseState) {
+	if cfg.ArchiveRequestHeartbeatInterval <= 0 {
+		return
+	}
+	ticker := newArchiveHeartbeatTicker(cfg.ArchiveRequestHeartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			req, err := client.HeartbeatArchiveRequest(ctx, requestID, state.Token())
+			if err != nil {
+				if !isHTTPStatus(err, 409) {
+					log.Printf("archive request heartbeat failed: request_id=%s err=%v", requestID, err)
+				}
+				continue
+			}
+			state.Update(req)
+		}
+	}
+}
+
+func failArchiveRequest(ctx context.Context, client archiveRequestClient, requestID, leaseToken string, payload vps.ArchiveRequestFailPayload) error {
+	if err := client.FailArchiveRequest(ctx, requestID, leaseToken, payload); err != nil {
+		if isHTTPStatus(err, 409) {
+			return nil
+		}
+		return fmt.Errorf("report archive request failure failed: %w", err)
+	}
+	return fmt.Errorf("archive request %s failed: %s", requestID, payload.Message)
 }
 
 func resolveDownloadRequestArtifact(req *vps.DownloadRequest, objectRoot string) (string, error) {
@@ -996,8 +1254,22 @@ func resolveArtifactPathByKind(objectRoot, artifactKind, variant string) (string
 	expectedVariant := ""
 	switch artifactKind {
 	case "pdf":
-		targets = []target{{dir: filepath.Join(objectRoot, "derivatives", "access"), exts: map[string]struct{}{".pdf": {}}}}
-		expectedVariant = "access_v1"
+		switch strings.TrimSpace(variant) {
+		case "", "access_v1":
+			path := filepath.Join(objectRoot, "derivatives", "access", "reading_v1.pdf")
+			if _, err := os.Stat(path); err != nil {
+				return "", err
+			}
+			return path, nil
+		case "access_ocr_v1":
+			path := filepath.Join(objectRoot, "derivatives", "access", "reading_ocr_v1.pdf")
+			if _, err := os.Stat(path); err != nil {
+				return "", err
+			}
+			return path, nil
+		default:
+			return "", os.ErrNotExist
+		}
 	case "thumbnail":
 		targets = []target{{dir: filepath.Join(objectRoot, "derivatives", "images", "thumb"), exts: map[string]struct{}{".jpg": {}, ".jpeg": {}, ".png": {}}}}
 		expectedVariant = "thumb_v1"
@@ -1098,15 +1370,25 @@ func buildAvailableFilesSnapshot(objectID, objectRoot string, includeOriginals b
 		variant      string
 		displayName  string
 		exts         map[string]struct{}
+		fileName     string
 	}
 
 	targets := []scanTarget{
 		{
 			relDir:       filepath.Join("derivatives", "access"),
 			artifactKind: "pdf",
+			variant:      "access_ocr_v1",
+			displayName:  "Searchable PDF",
+			exts:         map[string]struct{}{".pdf": {}},
+			fileName:     "reading_ocr_v1.pdf",
+		},
+		{
+			relDir:       filepath.Join("derivatives", "access"),
+			artifactKind: "pdf",
 			variant:      "access_v1",
 			displayName:  "Access PDF",
 			exts:         map[string]struct{}{".pdf": {}},
+			fileName:     "reading_v1.pdf",
 		},
 		{
 			relDir:       filepath.Join("derivatives", "images", "thumb"),
@@ -1114,6 +1396,7 @@ func buildAvailableFilesSnapshot(objectID, objectRoot string, includeOriginals b
 			variant:      "thumb_v1",
 			displayName:  "Thumbnail",
 			exts:         map[string]struct{}{".jpg": {}, ".jpeg": {}, ".png": {}},
+			fileName:     "",
 		},
 		{
 			relDir:       filepath.Join("derivatives", "images", "web"),
@@ -1121,6 +1404,7 @@ func buildAvailableFilesSnapshot(objectID, objectRoot string, includeOriginals b
 			variant:      "web_v1",
 			displayName:  "Web Version",
 			exts:         map[string]struct{}{".jpg": {}, ".jpeg": {}, ".png": {}},
+			fileName:     "",
 		},
 		{
 			relDir:       "ocr",
@@ -1128,6 +1412,7 @@ func buildAvailableFilesSnapshot(objectID, objectRoot string, includeOriginals b
 			variant:      "ocr_text_v1",
 			displayName:  "OCR Text",
 			exts:         map[string]struct{}{".txt": {}},
+			fileName:     "",
 		},
 	}
 	if includeOriginals {
@@ -1137,12 +1422,13 @@ func buildAvailableFilesSnapshot(objectID, objectRoot string, includeOriginals b
 			variant:      "original_v1",
 			displayName:  "Original File",
 			exts:         map[string]struct{}{},
+			fileName:     "",
 		})
 	}
 
 	for _, target := range targets {
 		dir := filepath.Join(objectRoot, target.relDir)
-		path, err := findFirstMatchingFile(dir, target.exts)
+		path, err := findArtifactFile(dir, target.fileName, target.exts)
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue
@@ -1182,6 +1468,17 @@ func buildAvailableFilesSnapshot(objectID, objectRoot string, includeOriginals b
 	})
 
 	return files, nil
+}
+
+func findArtifactFile(dir, fileName string, allowedExts map[string]struct{}) (string, error) {
+	if strings.TrimSpace(fileName) != "" {
+		path := filepath.Join(dir, fileName)
+		if _, err := os.Stat(path); err != nil {
+			return "", err
+		}
+		return path, nil
+	}
+	return findFirstMatchingFile(dir, allowedExts)
 }
 
 func contentTypeFromFilename(name string) string {
@@ -1227,10 +1524,11 @@ func deliverEvent(ctx context.Context, d *db.DB, client *vps.Client, ev db.VPSEv
 	}
 
 	event := vps.Event{
-		EventID:   ev.EventID,
-		EventType: ev.EventType,
-		ObjectID:  ev.ObjectID.String,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		EventID:         ev.EventID,
+		EventType:       ev.EventType,
+		IngestionItemID: ev.IngestionItemID.String,
+		ObjectID:        ev.ObjectID.String,
+		Timestamp:       time.Now().UTC().Format(time.RFC3339),
 	}
 	var payload map[string]any
 	if err := json.Unmarshal([]byte(ev.PayloadJSON), &payload); err != nil {
@@ -1271,6 +1569,54 @@ func computeNextAttempt(attempts int) string {
 	jitter := time.Duration(rand.Int63n(int64(delay / 4)))
 	next := time.Now().UTC().Add(delay + jitter)
 	return next.Format(time.RFC3339)
+}
+
+func jitterDuration(min, max time.Duration) time.Duration {
+	if max <= min {
+		return min
+	}
+	return min + time.Duration(rand.Int63n(int64(max-min)+1))
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+func isHTTPStatus(err error, status int) bool {
+	actual, ok := httpStatusCode(err)
+	return ok && actual == status
+}
+
+func httpStatusCode(err error) (int, bool) {
+	if err == nil {
+		return 0, false
+	}
+	msg := err.Error()
+	for i := 0; i+10 <= len(msg); i++ {
+		if msg[i:i+7] != "status " {
+			continue
+		}
+		code := msg[i+7 : i+10]
+		if code[0] < '0' || code[0] > '9' || code[1] < '0' || code[1] > '9' || code[2] < '0' || code[2] > '9' {
+			continue
+		}
+		v, convErr := strconv.Atoi(code)
+		if convErr != nil {
+			continue
+		}
+		return v, true
+	}
+	return 0, false
 }
 
 func isLeaseValid(leaseExpiresAt string) bool {

@@ -22,6 +22,8 @@ type Config struct {
 	LeaseHeartbeatInterval           time.Duration
 	DownloadRequestPollInterval      time.Duration
 	DownloadRequestHeartbeatInterval time.Duration
+	ArchiveRequestPollInterval       time.Duration
+	ArchiveRequestHeartbeatInterval  time.Duration
 
 	VPSNotifierPollInterval        time.Duration
 	VPSNotifierBatchSize           int
@@ -46,6 +48,8 @@ func Load() Config {
 		LeaseHeartbeatInterval:           getenvDuration("LEASE_HEARTBEAT_INTERVAL", 90*time.Second),
 		DownloadRequestPollInterval:      getenvDuration("DOWNLOAD_REQUEST_POLL_INTERVAL", 5*time.Second),
 		DownloadRequestHeartbeatInterval: getenvDuration("DOWNLOAD_REQUEST_HEARTBEAT_INTERVAL", 90*time.Second),
+		ArchiveRequestPollInterval:       getenvDuration("ARCHIVE_REQUEST_POLL_INTERVAL", 5*time.Second),
+		ArchiveRequestHeartbeatInterval:  getenvDuration("ARCHIVE_REQUEST_HEARTBEAT_INTERVAL", 60*time.Second),
 
 		VPSNotifierPollInterval:        getenvDuration("VPS_NOTIFIER_POLL_INTERVAL", 3*time.Second),
 		VPSNotifierBatchSize:           getenvInt("VPS_NOTIFIER_BATCH_SIZE", 50),

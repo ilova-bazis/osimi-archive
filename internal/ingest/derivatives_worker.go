@@ -11,7 +11,10 @@ import (
 	"strings"
 
 	"github.com/ilova-bazis/osimi-archive/internal/db"
+	"github.com/ilova-bazis/osimi-archive/internal/ocrlang"
 )
+
+const scannedDocumentAccessMaxSize = 2400
 
 type DerivativesWorker struct {
 	DB                *db.DB
@@ -19,10 +22,11 @@ type DerivativesWorker struct {
 	AudioProcessor    AudioProcessor
 	VideoProcessor    VideoProcessor
 	DocumentProcessor DocumentProcessor
+	SearchablePDF     SearchablePDFProcessor
 }
 
 func (w *DerivativesWorker) RunOnce(ctx context.Context) (bool, error) {
-	if w.ImageProcessor == nil || w.AudioProcessor == nil || w.VideoProcessor == nil || w.DocumentProcessor == nil {
+	if w.ImageProcessor == nil || w.AudioProcessor == nil || w.VideoProcessor == nil || w.DocumentProcessor == nil || w.SearchablePDF == nil {
 		return false, fmt.Errorf("derivatives processors not configured")
 	}
 	job, err := w.DB.ClaimNextJob(ctx, "derivatives")
@@ -84,6 +88,7 @@ func (w *DerivativesWorker) processDerivatives(ctx context.Context, objectID, jo
 		return fmt.Errorf("unable to resolve item_kind for derivatives")
 	}
 
+	finalState := "derivatives_done"
 	switch itemKind {
 	case "scanned_document":
 		pagesDir := filepath.Join(objectRoot, "original", "pages")
@@ -94,8 +99,25 @@ func (w *DerivativesWorker) processDerivatives(ctx context.Context, objectID, jo
 		if len(sourceFiles) == 0 {
 			return fmt.Errorf("no pages found in %s", pagesDir)
 		}
+		if err := buildScannedDocumentThumbnail(ctx, objectRoot, sourceFiles[0], w.ImageProcessor); err != nil {
+			return err
+		}
 		if err := buildAccessPDF(ctx, objectRoot, sourceFiles, w.ImageProcessor); err != nil {
 			return err
+		}
+		ocrEnabled, ocrLang, err := derivativesOCRIntent(catalog, itemKind)
+		if err != nil {
+			return err
+		}
+		if ocrEnabled {
+			if !ocrComplete(objectRoot) {
+				finalState = "ingested"
+				break
+			}
+			if err := buildSearchableAccessPDF(ctx, objectRoot, ocrLang, w.SearchablePDF); err != nil {
+				return err
+			}
+			finalState = "ocr_done"
 		}
 	case "photo":
 		photosDir := filepath.Join(objectRoot, "original", "photos")
@@ -140,7 +162,7 @@ func (w *DerivativesWorker) processDerivatives(ctx context.Context, objectID, jo
 		return fmt.Errorf("derivatives not supported for item_kind=%s", itemKind)
 	}
 
-	if err := w.DB.SetObjectProcessingState(ctx, objectID, "derivatives_done", true); err != nil {
+	if err := w.DB.SetObjectProcessingState(ctx, objectID, finalState, true); err != nil {
 		return err
 	}
 	if err := w.DB.AddJobEvent(ctx, jobID, objectID, "info", "derivatives completed"); err != nil {
@@ -158,9 +180,16 @@ func (w *DerivativesWorker) processDerivatives(ctx context.Context, objectID, jo
 }
 
 type derivativesCatalog struct {
-	ItemKind       string `json:"item_kind,omitempty"`
+	ItemKind   string `json:"item_kind,omitempty"`
+	Processing struct {
+		OCRText *struct {
+			Enabled  *bool  `json:"enabled,omitempty"`
+			Language string `json:"language,omitempty"`
+		} `json:"ocr_text,omitempty"`
+	} `json:"processing,omitempty"`
 	Classification struct {
-		Type string `json:"type,omitempty"`
+		Type     string `json:"type,omitempty"`
+		Language string `json:"language,omitempty"`
 	} `json:"classification,omitempty"`
 }
 
@@ -197,6 +226,32 @@ func resolveDerivativesKind(c derivativesCatalog) string {
 	}
 }
 
+func derivativesOCRIntent(c derivativesCatalog, itemKind string) (bool, string, error) {
+	if c.Processing.OCRText != nil && c.Processing.OCRText.Enabled != nil {
+		lang, err := resolveDerivativesOCRLanguage(c)
+		return *c.Processing.OCRText.Enabled, lang, err
+	}
+	if itemKind == "scanned_document" {
+		lang, err := resolveDerivativesOCRLanguage(c)
+		return true, lang, err
+	}
+	return false, "", nil
+}
+
+func resolveDerivativesOCRLanguage(c derivativesCatalog) (string, error) {
+	preferred := ""
+	if c.Processing.OCRText != nil && strings.TrimSpace(c.Processing.OCRText.Language) != "" {
+		preferred = strings.TrimSpace(c.Processing.OCRText.Language)
+	}
+	return ocrlang.Resolve(preferred, strings.TrimSpace(c.Classification.Language))
+}
+
+func ocrComplete(objectRoot string) bool {
+	marker := filepath.Join(objectRoot, "ocr", "OCR_DONE")
+	_, err := os.Stat(marker)
+	return err == nil
+}
+
 func buildAccessPDF(ctx context.Context, objectRoot string, sourceFiles []string, processor ImageProcessor) error {
 	outDir := filepath.Join(objectRoot, "derivatives", "access")
 	if err := os.MkdirAll(outDir, 0755); err != nil {
@@ -208,30 +263,18 @@ func buildAccessPDF(ctx context.Context, objectRoot string, sourceFiles []string
 		return nil
 	}
 
+	normalizedFiles, err := normalizeScannedDocumentPages(ctx, sourceFiles, processor)
+	if err != nil {
+		return err
+	}
+	defer removeFiles(normalizedFiles)
+
 	tool, err := exec.LookPath("img2pdf")
 	if err != nil {
 		return fmt.Errorf("img2pdf not found in PATH")
 	}
 
-	normalizedDir := filepath.Join(objectRoot, "derivatives", "tmp", "normalized")
-	if err := os.MkdirAll(normalizedDir, 0755); err != nil {
-		return err
-	}
-	defer func() {
-		_ = os.RemoveAll(filepath.Join(objectRoot, "derivatives", "tmp"))
-	}()
-
-	var normalized []string
-	for i, src := range sourceFiles {
-		name := fmt.Sprintf("page_%04d.png", i+1)
-		outPath := filepath.Join(normalizedDir, name)
-		if err := processor.Normalize(ctx, src, outPath); err != nil {
-			return err
-		}
-		normalized = append(normalized, outPath)
-	}
-
-	args := append([]string{"-o", output}, normalized...)
+	args := append([]string{"-o", output}, normalizedFiles...)
 	cmd := exec.CommandContext(ctx, tool, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		msg := strings.TrimSpace(string(out))
@@ -241,6 +284,66 @@ func buildAccessPDF(ctx context.Context, objectRoot string, sourceFiles []string
 		return fmt.Errorf("img2pdf failed: %s", msg)
 	}
 	return nil
+}
+
+func normalizeScannedDocumentPages(ctx context.Context, sourceFiles []string, processor ImageProcessor) ([]string, error) {
+	normalizedFiles := make([]string, 0, len(sourceFiles))
+	for _, src := range sourceFiles {
+		dir := filepath.Dir(src)
+		base := strings.TrimSuffix(filepath.Base(src), filepath.Ext(src))
+		tmpFile, err := os.CreateTemp(dir, base+"-access-*.jpg")
+		if err != nil {
+			removeFiles(normalizedFiles)
+			return nil, fmt.Errorf("create temp access image: %w", err)
+		}
+		tmpPath := tmpFile.Name()
+		if err := tmpFile.Close(); err != nil {
+			removeFiles(append(normalizedFiles, tmpPath))
+			return nil, fmt.Errorf("close temp access image: %w", err)
+		}
+		if err := processor.Resize(ctx, src, tmpPath, scannedDocumentAccessMaxSize); err != nil {
+			removeFiles(append(normalizedFiles, tmpPath))
+			return nil, fmt.Errorf("normalize scanned document page %s: %w", filepath.Base(src), err)
+		}
+		normalizedFiles = append(normalizedFiles, tmpPath)
+	}
+	return normalizedFiles, nil
+}
+
+func removeFiles(paths []string) {
+	for _, path := range paths {
+		_ = os.Remove(path)
+	}
+}
+
+func buildScannedDocumentThumbnail(ctx context.Context, objectRoot, firstPage string, processor ImageProcessor) error {
+	thumbDir := filepath.Join(objectRoot, "derivatives", "images", "thumb")
+	if err := os.MkdirAll(thumbDir, 0755); err != nil {
+		return err
+	}
+	output := filepath.Join(thumbDir, "thumb.jpg")
+	if _, err := os.Stat(output); err == nil {
+		return nil
+	}
+	return processor.Resize(ctx, firstPage, output, 400)
+}
+
+func buildSearchableAccessPDF(ctx context.Context, objectRoot, lang string, processor SearchablePDFProcessor) error {
+	accessDir := filepath.Join(objectRoot, "derivatives", "access")
+	input := filepath.Join(accessDir, "reading_v1.pdf")
+	output := filepath.Join(accessDir, "reading_ocr_v1.pdf")
+	if _, err := os.Stat(output); err == nil {
+		return nil
+	}
+	if _, err := os.Stat(input); err != nil {
+		return fmt.Errorf("base access pdf missing: %w", err)
+	}
+	tmpOutput := output + ".tmp"
+	defer os.Remove(tmpOutput)
+	if err := processor.AddTextLayer(ctx, input, tmpOutput, lang); err != nil {
+		return err
+	}
+	return os.Rename(tmpOutput, output)
 }
 
 func buildPhotoDerivatives(ctx context.Context, objectRoot string, sourceFiles []string, processor ImageProcessor) error {

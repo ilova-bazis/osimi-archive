@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/ilova-bazis/osimi-archive/internal/db"
+	"github.com/ilova-bazis/osimi-archive/internal/ocrlang"
 )
 
 type OCRWorker struct {
@@ -77,6 +78,13 @@ func (w *OCRWorker) parseOCRPayload(payload sql.NullString) (ocrPayload, string,
 		if err := json.Unmarshal([]byte(payload.String), &p); err != nil {
 			return ocrPayload{}, "", fmt.Errorf("invalid ocr payload_json: %w", err)
 		}
+	}
+	if strings.TrimSpace(p.Language) != "" {
+		lang, err := ocrlang.Normalize(p.Language)
+		if err != nil {
+			return ocrPayload{}, "", fmt.Errorf("invalid ocr language: %w", err)
+		}
+		p.Language = lang
 	}
 	return p, p.Language, nil
 }
@@ -151,6 +159,9 @@ func (w *OCRWorker) processOCR(ctx context.Context, objectID, jobID, lang string
 
 	if err := w.writePipelineManifest(ctx, objectRoot, objectID, jobID); err != nil {
 		log.Printf("ocr worker write pipeline manifest failed: %v", err)
+	}
+	if err := w.DB.SignalOrchestratorWakeup(ctx); err != nil {
+		log.Printf("ocr worker signal orchestrator wakeup failed: %v", err)
 	}
 
 	return nil

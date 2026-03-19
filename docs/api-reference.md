@@ -174,7 +174,7 @@ Ingestion response shapes in this section are authoritative with `src/validation
 - `id` (string)
 - `batch_label` (string)
 - `tenant_id` (string)
-- `status` (`DRAFT|UPLOADING|QUEUED|PROCESSING|COMPLETED|FAILED|CANCELED`)
+- `status` (`DRAFT|UPLOADING|QUEUED|PROCESSING|COMPLETED|COMPLETED_WITH_ERRORS|FAILED|CANCELED`)
 - `created_by` (string)
 - `schema_version` (string)
 - `classification_type` (`newspaper_article|magazine_article|book_chapter|book|letter|speech|interview|report|manuscript|image|document|other`)
@@ -206,6 +206,35 @@ Ingestion response shapes in this section are authoritative with `src/validation
 - `error` (JSON object)
 - `created_at` (ISO timestamp string)
 - `updated_at` (ISO timestamp string)
+
+### Ingestion Item Schema
+
+- `id` (string)
+- `ingestion_id` (string)
+- `item_index` (number; integer >= 1)
+- `status` (`PENDING|READY|PROCESSING|COMPLETED|FAILED|SKIPPED`)
+- `classification_type` (`newspaper_article|magazine_article|book_chapter|book|letter|speech|interview|report|manuscript|image|document|other`, nullable)
+- `item_kind` (`photo|audio|video|scanned_document|document|other`, nullable)
+- `language_code` (string, nullable)
+- `title` (string, nullable)
+- `summary` (JSON object)
+- `error_summary` (JSON object)
+- `object_id` (string, nullable)
+- `created_at` (ISO timestamp string)
+- `updated_at` (ISO timestamp string)
+
+### Ingestion Item File Schema
+
+- `id` (string)
+- `ingestion_item_id` (string)
+- `ingestion_file_id` (string)
+- `ingestion_id` (string)
+- `role` (`primary|front|back|page|attachment|transcript_source|side_a|side_b|other`)
+- `sort_order` (number; integer >= 1)
+- `page_number` (number, nullable)
+- `is_primary` (boolean)
+- `logical_label` (string, nullable)
+- `created_at` (ISO timestamp string)
 
 ### POST `/api/ingestions`
 
@@ -282,6 +311,93 @@ Ingestion response shapes in this section are authoritative with `src/validation
   - `403 FORBIDDEN` when authenticated role is not allowed
   - `404 NOT_FOUND` when ingestion does not exist in tenant scope
 
+### POST `/api/ingestions/:id/items`
+
+- Auth: Bearer token
+- Roles: `archiver`, `admin`
+- Body:
+  - `item_index` (number, required, integer >= 1)
+  - `classification_type` (optional)
+  - `item_kind` (optional)
+  - `language_code` (optional string, non-empty)
+  - `title` (optional string, non-empty)
+  - `summary` (optional JSON object)
+- Preconditions:
+  - ingestion status is `DRAFT`, `UPLOADING`, or `CANCELED`
+  - ingestion has no active lease
+- 201 response:
+  - `item` (Ingestion Item Schema)
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid path/body shape
+  - `401 UNAUTHORIZED` for missing/invalid/expired session token
+  - `403 FORBIDDEN` when authenticated role is not allowed
+  - `404 NOT_FOUND` when ingestion does not exist in tenant scope
+  - `409 CONFLICT` when ingestion cannot be modified in current status or has active lease
+
+### GET `/api/ingestions/:id/items`
+
+- Auth: Bearer token
+- Roles: `viewer`, `archiver`, `admin`
+- 200 response:
+  - `items[]` (array of Ingestion Item Schema)
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid path params
+  - `401 UNAUTHORIZED` for missing/invalid/expired session token
+  - `403 FORBIDDEN` when authenticated role is not allowed
+  - `404 NOT_FOUND` when ingestion does not exist in tenant scope
+
+### PATCH `/api/ingestions/:id/items/order`
+
+- Auth: Bearer token
+- Roles: `archiver`, `admin`
+- Body:
+  - `items[]` (required, non-empty)
+    - each item: `{ ingestion_item_id, item_index }`
+- Semantics:
+  - full-set reorder; payload must contain exactly all current ingestion items
+  - `item_index` values must be unique and >= 1
+- Preconditions:
+  - ingestion status is `DRAFT`, `UPLOADING`, or `CANCELED`
+  - ingestion has no active lease
+- 200 response:
+  - `items[]` (array of Ingestion Item Schema, ordered by `item_index`)
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid path/body shape
+  - `401 UNAUTHORIZED` for missing/invalid/expired session token
+  - `403 FORBIDDEN` when authenticated role is not allowed
+  - `409 CONFLICT` for full-set mismatch or immutable ingestion state
+
+### PATCH `/api/ingestions/:id/items/:itemId`
+
+- Auth: Bearer token
+- Roles: `archiver`, `admin`
+- Body (merge semantics; at least one field):
+  - `classification_type` (optional)
+  - `item_kind` (optional)
+  - `language_code` (optional string, non-empty)
+  - `title` (optional string or `null`)
+  - `description` (optional string or `null`; stored in `summary.classification.summary`)
+  - `tags` (optional string[]; normalized and de-duplicated)
+  - `dates` (optional object):
+    - `published` and/or `created` (partial patch allowed)
+      - `value` (YYYY, YYYY-MM, YYYY-MM-DD, or `null`)
+      - `approximate` (boolean)
+      - `confidence` (`low`, `medium`, `high`)
+      - `note` (string or `null`)
+- Semantics:
+  - merges into existing item `summary`; unspecified fields are preserved
+- Preconditions:
+  - ingestion status is `DRAFT`, `UPLOADING`, or `CANCELED`
+  - ingestion has no active lease
+- 200 response:
+  - `item` (Ingestion Item Schema)
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid path/body shape
+  - `401 UNAUTHORIZED` for missing/invalid/expired session token
+  - `403 FORBIDDEN` when authenticated role is not allowed
+  - `404 NOT_FOUND` when ingestion/item does not exist in tenant scope
+  - `409 CONFLICT` when ingestion cannot be modified in current status or has active lease
+
 ### PATCH `/api/ingestions/:id`
 
 - Auth: Bearer token
@@ -352,11 +468,11 @@ Ingestion response shapes in this section are authoritative with `src/validation
   - `filename` (string, required, non-empty)
   - `content_type` (string, required, non-empty)
   - `size_bytes` (number, required, integer >= 1)
-- Planned (not yet implemented):
-  - optional `source_order` (integer `>= 0`) to persist client-intended page/file sequence
 - Body (re-presign existing):
   - `file_id` (UUID)
 - Body must match exactly one shape above.
+- Note:
+  - item-level file ordering is managed via ingestion item file APIs (`sort_order`), not via presign payload.
 - Behavior:
   - if ingestion is `CANCELED`, backend reopens it to `DRAFT` (no files) or `UPLOADING` (has files) before presign flow
   - re-presign is rejected when target file is already committed (`UPLOADED` or `VALIDATED`)
@@ -425,6 +541,62 @@ Ingestion response shapes in this section are authoritative with `src/validation
   - `403 FORBIDDEN` when authenticated role is not allowed
   - `404 NOT_FOUND` when ingestion or file does not exist in tenant scope
   - `409 CONFLICT` for uncommittable state, missing staged upload, media-kind mismatch, size mismatch, or checksum mismatch
+
+### POST `/api/ingestions/:id/items/:itemId/files`
+
+- Auth: Bearer token
+- Roles: `archiver`, `admin`
+- Body:
+  - `ingestion_file_id` (UUID, required)
+  - `role` (optional; `primary|front|back|page|attachment|transcript_source|side_a|side_b|other`)
+  - `sort_order` (number, required, integer >= 1)
+  - `page_number` (optional number, integer >= 1)
+  - `is_primary` (optional boolean)
+  - `logical_label` (optional string, non-empty)
+- Preconditions:
+  - ingestion status is `DRAFT`, `UPLOADING`, or `CANCELED`
+  - ingestion has no active lease
+- 201 response:
+  - `file` (Ingestion Item File Schema)
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid path/body shape
+  - `401 UNAUTHORIZED` for missing/invalid/expired session token
+  - `403 FORBIDDEN` when authenticated role is not allowed
+  - `404 NOT_FOUND` when ingestion/item does not exist in tenant scope
+  - `409 CONFLICT` when ingestion cannot be modified in current status, has active lease, or ordering constraints are violated
+
+### GET `/api/ingestions/:id/items/:itemId/files`
+
+- Auth: Bearer token
+- Roles: `viewer`, `archiver`, `admin`
+- 200 response:
+  - `files[]` (array of Ingestion Item File Schema, ordered by `sort_order`)
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid path params
+  - `401 UNAUTHORIZED` for missing/invalid/expired session token
+  - `403 FORBIDDEN` when authenticated role is not allowed
+  - `404 NOT_FOUND` when ingestion/item does not exist in tenant scope
+
+### PATCH `/api/ingestions/:id/items/:itemId/files/order`
+
+- Auth: Bearer token
+- Roles: `archiver`, `admin`
+- Body:
+  - `files[]` (required, non-empty)
+    - each file: `{ ingestion_file_id, sort_order }`
+- Semantics:
+  - full-set reorder; payload must contain exactly all files currently linked to item
+  - `sort_order` values must be unique and >= 1
+- Preconditions:
+  - ingestion status is `DRAFT`, `UPLOADING`, or `CANCELED`
+  - ingestion has no active lease
+- 200 response:
+  - `files[]` (array of Ingestion Item File Schema, ordered by `sort_order`)
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid path/body shape
+  - `401 UNAUTHORIZED` for missing/invalid/expired session token
+  - `403 FORBIDDEN` when authenticated role is not allowed
+  - `409 CONFLICT` for full-set mismatch or immutable ingestion state
 
 ### POST `/api/ingestions/:id/submit`
 
@@ -689,6 +861,37 @@ Example response:
 }
 ```
 
+### GET `/api/archive-requests`
+
+- Auth: Bearer token
+- Roles: `viewer`, `archiver`, `admin`
+- Purpose:
+  - unified request visibility endpoint for tenant-wide and object-specific archive tasks
+  - use filters instead of separate per-task GET endpoints
+- Query params:
+  - `limit` (optional int `1..200`, default `50`)
+  - `cursor` (optional pagination cursor)
+  - `sort` (optional; currently `created_at_desc` only)
+  - `target_type` (optional `object|ingestion`)
+  - `target_id` (optional string; requires `target_type`; for `target_type=object` must match `OBJ-YYYYMMDD-XXXXXX`)
+  - `action_type` (optional `object_resync|artifact_fetch`)
+  - `status` (optional; can be repeated and/or comma-separated; values `PENDING|PROCESSING|COMPLETED|FAILED|CANCELED`)
+  - `active_only` (optional boolean; when `true`, equivalent to filtering `PENDING|PROCESSING`)
+  - `include_payload` (optional boolean, default `false`; when `true`, each item includes `action_payload`)
+- 200 response:
+  - `requests[]` where each item includes:
+    - `id`, `tenant_id`, `target_type`, `target_id`, `action_type`
+    - `requested_by`, `dedupe_key`, `status`
+    - `failure_reason`, `failure_details`
+    - `created_at`, `updated_at`, `completed_at`
+    - `action_payload` only when `include_payload=true`
+  - `next_cursor` (`string|null`)
+  - `filtered_count` (number)
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid query params/cursor/filter combinations
+  - `401 UNAUTHORIZED` for missing/invalid/expired session token
+  - `403 FORBIDDEN` when authenticated role is not allowed
+
 ### PATCH `/api/objects/:object_id`
 
 - Auth: Bearer token
@@ -740,7 +943,7 @@ Example response:
   - `available_file_id` (UUID from `GET /api/objects/:object_id/available-files`, required)
 - Behavior:
   - If matching artifact already exists on backend (`object_id + artifact_kind + variant`), request is not queued and response returns `status = available` with artifact payload.
-  - If artifact is missing, backend queues (or reuses existing active) request and returns `status = queued` with request payload.
+  - If artifact is missing, backend queues (or reuses existing active) generic archive request with `action_type = artifact_fetch` and returns `status = queued` with request payload.
 - 200 response:
   - when artifact already exists: `status: "available"`, `object_id`, `artifact`
   - when an active request already exists: `status: "queued"`, `object_id`, `request`
@@ -754,6 +957,8 @@ Example response:
 
 ### GET `/api/objects/:object_id/download-requests`
 
+- Compatibility read endpoint; prefer `GET /api/archive-requests` for unified request visibility.
+
 - Auth: Bearer token
 - Roles: `viewer`, `archiver`, `admin`
 - 200 response:
@@ -766,9 +971,56 @@ Example response:
   - `403 FORBIDDEN` when authenticated role is not allowed
   - `404 NOT_FOUND` when object does not exist in tenant scope
 
+### POST `/api/objects/:object_id/resync`
+
+- Auth: Bearer token
+- Roles: `archiver`, `admin`
+- Body:
+  - optional JSON object
+  - `action_payload` (optional object; defaults to `{}`)
+- Behavior:
+  - creates a generic archive request with:
+    - `target_type = object`
+    - `target_id = :object_id`
+    - `action_type = object_resync`
+  - request creation is idempotent for active requests (`PENDING|PROCESSING`) using dedupe key `object_resync:<object_id>`
+- 201 response:
+  - when new request is created: `status: "queued"`, `object_id`, `request`
+- 200 response:
+  - when an active request already exists: `status: "queued"`, `object_id`, `request`
+- `request` fields:
+  - `id`, `tenant_id`, `target_type`, `target_id`, `action_type`, `action_payload`, `requested_by`, `dedupe_key`, `status`, `failure_reason`, `failure_details`, `created_at`, `updated_at`, `completed_at`
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid `:object_id` format or invalid JSON/body
+  - `401 UNAUTHORIZED` for missing/invalid/expired session token
+  - `403 FORBIDDEN` when authenticated role is not allowed
+  - `404 NOT_FOUND` when object does not exist in tenant scope
+
+### GET `/api/objects/:object_id/resync-requests`
+
+- Compatibility read endpoint; prefer `GET /api/archive-requests` for unified request visibility.
+
+- Auth: Bearer token
+- Roles: `viewer`, `archiver`, `admin`
+- 200 response:
+  - `object_id`
+  - `requests[]` for `object_resync` action only, each with:
+    - `id`, `tenant_id`, `target_type`, `target_id`, `action_type`, `action_payload`, `requested_by`, `dedupe_key`, `status`, `failure_reason`, `failure_details`, `created_at`, `updated_at`, `completed_at`
+  - request `status` values: `PENDING|PROCESSING|COMPLETED|FAILED|CANCELED`
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid `:object_id` format
+  - `401 UNAUTHORIZED` for missing/invalid/expired session token
+  - `403 FORBIDDEN` when authenticated role is not allowed
+  - `404 NOT_FOUND` when object does not exist in tenant scope
+
 Worker-only object endpoints are documented in `## Worker APIs`:
 
 - `PUT /api/internal/objects/:object_id/available-files`
+- `POST /api/archive-requests/lease`
+- `POST /api/archive-requests/:id/lease/heartbeat`
+- `POST /api/archive-requests/:id/lease/release`
+- `POST /api/archive-requests/:id/complete`
+- `POST /api/archive-requests/:id/fail`
 - `POST /api/object-download-requests/lease`
 - `POST /api/object-download-requests/:id/lease/heartbeat`
 - `POST /api/object-download-requests/:id/lease/release`
@@ -939,7 +1191,10 @@ Worker-only object endpoints are documented in `## Worker APIs`:
 
 Worker APIs are for archive/ingestion workers, not UI clients.
 
-Integration guide for archive worker teams: `docs/archive-system-integration.md`.
+Integration guides for archive worker teams:
+
+- `docs/archive-system-integration.md` (ingestion/event pipeline)
+- `docs/archive-system-generic-requests.md` (generic archive request queue and worker lease flow)
 
 ### Worker Authentication
 
@@ -947,7 +1202,9 @@ Integration guide for archive worker teams: `docs/archive-system-integration.md`
 - Optional header: `x-worker-id: <worker-id>`
 - Missing/invalid worker token: `401 UNAUTHORIZED`
 - Missing server configuration for worker token: `500 CONFIGURATION_ERROR`
-- Lease-protected ingestion endpoints also require a valid body `lease_token` tied to the target ingestion.
+- Lease-protected ingestion endpoints require a valid body `lease_token` tied to the target ingestion.
+- Lease-protected archive-request endpoints require a valid body `lease_token` tied to the target archive request.
+- Worker request bodies must not provide `tenant_id`; tenant context is resolved by backend. `tenant_id` in worker lease responses is informational only.
 
 ### Ingestion Worker APIs
 
@@ -958,16 +1215,17 @@ Integration guide for archive worker teams: `docs/archive-system-integration.md`
 - Behavior:
   - returns next queued ingestion lease, or `lease: null` when no work is available
   - lease TTL is 5 minutes
-  - `download_urls[]` includes ingestion files in `UPLOADED|VALIDATED` status only
+  - `items[].files[]` includes ingestion files in `UPLOADED|VALIDATED` status only
 - 200 response:
   - `lease: null` when no queued ingestion available
-  - or `lease { lease_id, lease_token, lease_expires_at, ingestion_id, batch_label, tenant_id, download_urls[], catalog_json }`
-  - `catalog_json` is generated from ingestion first-class fields and `summary`
-- ingestion-stage leases may provide `catalog_json.object_id = null`
-- each `download_urls[]` item includes `checksum_sha256` for worker validation
-- each `download_urls[]` item includes `processing_overrides` (object; per-file overrides)
-- Planned (not yet implemented): each `download_urls[]` item will also include `filename` and `source_order`
-- Ordering rule target (planned): `source_order ASC NULLS LAST`, then `filename`, then `file_id`
+  - or
+    - `lease { lease_id, lease_token, lease_expires_at, ingestion_id, batch_label, tenant_id, items[] }`
+    - each `items[]` item: `{ ingestion_item_id, item_index, catalog_json, files[] }`
+    - each `files[]` item: `{ file_id, filename, sort_order, storage_key, content_type, size_bytes, checksum_sha256, processing_overrides, download_url }`
+- `catalog_json` is item-scoped and should be copied per future object
+- ordering rule:
+  - items: `item_index ASC`
+  - files inside item: `sort_order ASC`, then `filename`, then `file_id`
 - Error behavior:
   - `401 UNAUTHORIZED` for missing/invalid worker auth token
   - `409 CONFLICT` when queued ingestion metadata is not leasable (for example missing/invalid catalog metadata)
@@ -983,7 +1241,7 @@ Integration guide for archive worker teams: `docs/archive-system-integration.md`
   - deterministic targeted lease acquire for a specific ingestion id
   - no active-lease takeover is allowed (reacquire/recovery path only)
 - 200 response:
-  - `lease { lease_id, lease_token, lease_expires_at, ingestion_id, batch_label, tenant_id, download_urls[], catalog_json }`
+  - `lease { lease_id, lease_token, lease_expires_at, ingestion_id, batch_label, tenant_id, items[] }`
 - Error behavior:
   - `400 BAD_REQUEST` for invalid `:id` format
   - `401 UNAUTHORIZED` for missing/invalid worker auth token
@@ -1001,7 +1259,7 @@ Integration guide for archive worker teams: `docs/archive-system-integration.md`
 - Behavior:
   - extends active lease and returns refreshed `lease_token`
 - 200 response:
-  - refreshed `lease { lease_id, lease_token, lease_expires_at, ingestion_id, batch_label, tenant_id, download_urls[], catalog_json }`
+  - refreshed `lease { lease_id, lease_token, lease_expires_at, ingestion_id, batch_label, tenant_id, items[] }`
 - Error behavior:
   - `400 BAD_REQUEST` for invalid `:id` format or invalid body
   - `401 UNAUTHORIZED` for missing/invalid worker auth token or invalid/expired lease token
@@ -1065,11 +1323,17 @@ Integration guide for archive worker teams: `docs/archive-system-integration.md`
       - `PIPELINE_STEP_STARTED`
       - `PIPELINE_STEP_COMPLETED`
       - `PIPELINE_STEP_FAILED`
+      - `INGESTION_ITEM_CREATED`
+      - `INGESTION_ITEM_UPDATED`
+      - `INGESTION_ITEM_PROCESSING`
+      - `INGESTION_ITEM_COMPLETED`
+      - `INGESTION_ITEM_FAILED`
       - `OBJECT_CREATED`
       - `ARTIFACT_CREATED`
     - `timestamp` (ISO datetime string with offset)
     - `payload` (JSON object)
-    - `object_id` (required for `INGESTION_COMPLETED|OBJECT_CREATED|ARTIFACT_CREATED`; optional for other event types; when present must match object id format)
+    - `ingestion_item_id` (required for `INGESTION_ITEM_*` events)
+    - `object_id` (required for `INGESTION_ITEM_COMPLETED|OBJECT_CREATED|ARTIFACT_CREATED`; optional for other event types; when present must match object id format)
 - Behavior:
   - idempotent by `event_id`
   - out-of-order tolerant
@@ -1089,6 +1353,95 @@ Integration guide for archive worker teams: `docs/archive-system-integration.md`
   - `500 CONFIGURATION_ERROR` when worker auth token is not configured server-side
 
 ### Object Worker APIs
+
+### POST `/api/archive-requests/lease`
+
+- Auth: `x-worker-auth-token`
+- Optional: `x-worker-id`
+- Body:
+  - optional JSON object
+  - `action_type` (optional enum): `object_resync|artifact_fetch`
+- `tenant_id` is not accepted in request body
+- Behavior:
+  - sweeps expired archive-request leases before selecting next request
+  - lease TTL is 5 minutes
+  - when `action_type` is provided, leasing is filtered to that action type only
+- 200 response:
+  - `request: null` when no pending work
+  - otherwise `request` with:
+    - `request_id`, `lease_id`, `lease_token`, `lease_expires_at`
+    - `tenant_id`, `target_type`, `target_id`, `action_type`, `action_payload`
+    - `requested_by`, `dedupe_key`
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid body
+  - `401 UNAUTHORIZED` for missing/invalid worker auth token
+  - `500 CONFIGURATION_ERROR` when worker auth token is not configured server-side
+
+### POST `/api/archive-requests/:id/lease/heartbeat`
+
+- Auth: `x-worker-auth-token`
+- Body:
+  - `lease_token` (required non-empty string)
+- `tenant_id` is not accepted in request body
+- 200 response:
+  - `request` (`request_id`, `lease_id`, `lease_token`, `lease_expires_at`)
+- Behavior:
+  - returned `lease_token` is refreshed; use it for subsequent worker calls
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid path/body
+  - `401 UNAUTHORIZED` for missing/invalid worker auth token or invalid/expired lease token
+  - `409 CONFLICT` when lease is no longer active
+  - `500 CONFIGURATION_ERROR` when worker auth token is not configured server-side
+
+### POST `/api/archive-requests/:id/lease/release`
+
+- Auth: `x-worker-auth-token`
+- Body:
+  - `lease_token` (required non-empty string)
+- `tenant_id` is not accepted in request body
+- 200 response:
+  - `status: "ok"`, `request_id`
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid path/body
+  - `401 UNAUTHORIZED` for missing/invalid worker auth token or invalid/expired lease token
+  - `409 CONFLICT` when lease is no longer active
+  - `500 CONFIGURATION_ERROR` when worker auth token is not configured server-side
+
+### POST `/api/archive-requests/:id/complete`
+
+- Auth: `x-worker-auth-token`
+- Body:
+  - `lease_token` (required non-empty string)
+- `tenant_id` is not accepted in request body
+- 200 response:
+  - `status: "completed"`
+  - `request` (`id`, `tenant_id`, `target_type`, `target_id`, `action_type`, `action_payload`, `requested_by`, `dedupe_key`, `status`, `failure_reason`, `failure_details`, `created_at`, `updated_at`, `completed_at`)
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid path/body
+  - `401 UNAUTHORIZED` for missing/invalid worker auth token or invalid/expired lease token
+  - `409 CONFLICT` when lease is no longer active
+  - `500 CONFIGURATION_ERROR` when worker auth token is not configured server-side
+
+### POST `/api/archive-requests/:id/fail`
+
+- Auth: `x-worker-auth-token`
+- Body:
+  - `lease_token` (required non-empty string)
+  - `failure` object:
+    - `code` (required non-empty string)
+    - `message` (required non-empty string)
+    - `retryable` (boolean)
+    - `details` (object, optional)
+- `tenant_id` is not accepted in request body
+- Behavior:
+  - when omitted, `failure.details` is persisted as `{}`
+- 200 response:
+  - `status: "failed"`, `request_id`, `retryable`
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid path/body
+  - `401 UNAUTHORIZED` for missing/invalid worker auth token or invalid/expired lease token
+  - `409 CONFLICT` when lease is no longer active
+  - `500 CONFIGURATION_ERROR` when worker auth token is not configured server-side
 
 ### PUT `/api/internal/objects/:object_id/available-files`
 
@@ -1110,8 +1463,9 @@ Integration guide for archive worker teams: `docs/archive-system-integration.md`
 - Behavior:
   - tenant is resolved internally from `object_id`
   - Replaces object snapshot by archive key: upserts provided entries and marks omitted entries unavailable.
-  - Auto-thumbnail side effect: when snapshot contains available `thumbnail` entries, backend auto-queues one thumbnail download request if no thumbnail artifact exists and no active thumbnail request exists.
-  - Auto-thumbnail selection priority: prefer `variant = null`; otherwise choose lexicographically lowest `archive_file_key`.
+  - Auto-request side effect: backend attempts to auto-queue one `artifact_fetch` request per configured default kind (`thumbnail`, `ocr_text`) when corresponding available entries are present.
+  - Auto-request suppression: per kind, backend skips auto-queue when artifact already exists or an active request (`PENDING`/`PROCESSING`) already exists.
+  - Auto-request selection priority: for each kind, prefer `variant = null`; otherwise choose lexicographically lowest `archive_file_key`.
 - 200 response:
   - `object_id`
   - `synced_files` (number)

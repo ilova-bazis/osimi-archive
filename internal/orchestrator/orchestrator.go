@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ilova-bazis/osimi-archive/internal/db"
+	"github.com/ilova-bazis/osimi-archive/internal/ocrlang"
 )
 
 const (
@@ -142,10 +143,14 @@ func (o *Orchestrator) planObject(ctx context.Context, objectID, objectRoot stri
 
 	itemKind := resolveItemKind(catalog)
 	enqueued := false
+	ocrEnabled, ocrLang, err := ocrIntent(catalog, itemKind)
+	if err != nil {
+		return enqueued, err
+	}
 
 	fmt.Println("item kind is", itemKind)
 	if shouldRunDerivatives(catalog, itemKind) {
-		complete := derivativesComplete(itemKind, objectRoot)
+		complete := derivativesComplete(itemKind, objectRoot, ocrEnabled)
 		if !complete {
 			active, err := o.DB.HasActiveJob(ctx, objectID, "derivatives")
 			if err != nil {
@@ -161,7 +166,6 @@ func (o *Orchestrator) planObject(ctx context.Context, objectID, objectRoot stri
 		}
 	}
 
-	ocrEnabled, ocrLang := ocrIntent(catalog, itemKind)
 	fmt.Println("ocr enabled", ocrEnabled)
 	if ocrEnabled {
 		complete := ocrComplete(objectRoot)
@@ -268,14 +272,25 @@ func shouldRunDerivatives(c catalogManifest, itemKind string) bool {
 	}
 }
 
-func derivativesComplete(itemKind, objectRoot string) bool {
+func derivativesComplete(itemKind, objectRoot string, ocrEnabled bool) bool {
 	switch itemKind {
 	case "scanned_document":
 		accessPDF := filepath.Join(objectRoot, "derivatives", "access", "reading_v1.pdf")
-		if fileExists(accessPDF) {
+		thumb := filepath.Join(objectRoot, "derivatives", "images", "thumb", "thumb.jpg")
+		ocrPDF := filepath.Join(objectRoot, "derivatives", "access", "reading_ocr_v1.pdf")
+		if !fileExists(accessPDF) {
+			return false
+		}
+		if !fileExists(thumb) {
+			return false
+		}
+		if !ocrEnabled {
 			return true
 		}
-		return hasFiles(filepath.Join(objectRoot, "derivatives", "images", "web"))
+		if !ocrComplete(objectRoot) {
+			return true
+		}
+		return fileExists(ocrPDF)
 	case "photo":
 		return hasFiles(filepath.Join(objectRoot, "derivatives", "images", "web")) || hasFiles(filepath.Join(objectRoot, "derivatives", "images", "thumb"))
 	case "audio":
@@ -289,30 +304,31 @@ func derivativesComplete(itemKind, objectRoot string) bool {
 	}
 }
 
-func ocrIntent(c catalogManifest, itemKind string) (bool, string) {
+func ocrIntent(c catalogManifest, itemKind string) (bool, string, error) {
 	if c.Processing.OCRText != nil && c.Processing.OCRText.Enabled != nil {
 		enabled := *c.Processing.OCRText.Enabled
-		return enabled, resolveOCRLanguage(c)
+		lang, err := resolveOCRLanguage(c)
+		return enabled, lang, err
 	}
 
 	switch itemKind {
 	case "scanned_document":
-		return true, resolveOCRLanguage(c)
+		lang, err := resolveOCRLanguage(c)
+		return true, lang, err
 	case "photo", "audio":
-		return false, ""
+		return false, "", nil
 	default:
-		return false, ""
+		return false, "", nil
 	}
 }
 
-func resolveOCRLanguage(c catalogManifest) string {
-	if c.Processing.OCRText != nil && strings.TrimSpace(c.Processing.OCRText.Language) != "" {
-		return strings.TrimSpace(c.Processing.OCRText.Language)
+func resolveOCRLanguage(c catalogManifest) (string, error) {
+	preferred := ""
+	fallback := strings.TrimSpace(c.Classification.Language)
+	if c.Processing.OCRText != nil {
+		preferred = strings.TrimSpace(c.Processing.OCRText.Language)
 	}
-	if strings.TrimSpace(c.Classification.Language) != "" {
-		return strings.TrimSpace(c.Classification.Language)
-	}
-	return "eng"
+	return ocrlang.Resolve(preferred, fallback)
 }
 
 func ocrComplete(objectRoot string) bool {

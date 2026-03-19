@@ -60,12 +60,19 @@ func main() {
 	}
 	log.Printf("document processor: %s", documentProcessor.Name())
 
+	searchablePDFProcessor, err := ingest.NewSearchablePDFProcessor()
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("searchable pdf processor: %s", searchablePDFProcessor.Name())
+
 	derivativesWorker := &ingest.DerivativesWorker{
 		DB:                d,
 		ImageProcessor:    imageProcessor,
 		AudioProcessor:    audioProcessor,
 		VideoProcessor:    videoProcessor,
 		DocumentProcessor: documentProcessor,
+		SearchablePDF:     searchablePDFProcessor,
 	}
 	ocrWorker := &ingest.OCRWorker{DB: d}
 

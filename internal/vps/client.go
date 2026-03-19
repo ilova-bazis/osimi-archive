@@ -27,30 +27,41 @@ type LeaseResponse struct {
 }
 
 type Lease struct {
-	LeaseID        string          `json:"lease_id"`
-	LeaseToken     string          `json:"lease_token"`
-	LeaseExpiresAt string          `json:"lease_expires_at"`
-	IngestionID    string          `json:"ingestion_id"`
-	BatchLabel     string          `json:"batch_label"`
-	TenantID       string          `json:"tenant_id"`
-	DownloadURLs   []DownloadURL   `json:"download_urls"`
-	CatalogJSON    json.RawMessage `json:"catalog_json"`
+	LeaseID        string      `json:"lease_id"`
+	LeaseToken     string      `json:"lease_token"`
+	LeaseExpiresAt string      `json:"lease_expires_at"`
+	IngestionID    string      `json:"ingestion_id"`
+	BatchLabel     string      `json:"batch_label"`
+	TenantID       string      `json:"tenant_id"`
+	Items          []LeaseItem `json:"items"`
 }
 
-type DownloadURL struct {
-	FileID      string `json:"file_id"`
-	StorageKey  string `json:"storage_key"`
-	ContentType string `json:"content_type"`
-	SizeBytes   int64  `json:"size_bytes"`
-	DownloadURL string `json:"download_url"`
+type LeaseItem struct {
+	IngestionItemID string          `json:"ingestion_item_id"`
+	ItemIndex       int             `json:"item_index"`
+	CatalogJSON     json.RawMessage `json:"catalog_json"`
+	Files           []LeaseItemFile `json:"files"`
+}
+
+type LeaseItemFile struct {
+	FileID              string         `json:"file_id"`
+	Filename            string         `json:"filename"`
+	SortOrder           int            `json:"sort_order"`
+	StorageKey          string         `json:"storage_key"`
+	ContentType         string         `json:"content_type"`
+	SizeBytes           int64          `json:"size_bytes"`
+	ChecksumSHA256      string         `json:"checksum_sha256"`
+	ProcessingOverrides map[string]any `json:"processing_overrides"`
+	DownloadURL         string         `json:"download_url"`
 }
 
 type Event struct {
-	EventID   string         `json:"event_id"`
-	EventType string         `json:"event_type"`
-	ObjectID  string         `json:"object_id,omitempty"`
-	Timestamp string         `json:"timestamp"`
-	Payload   map[string]any `json:"payload"`
+	EventID         string         `json:"event_id"`
+	EventType       string         `json:"event_type"`
+	IngestionItemID string         `json:"ingestion_item_id,omitempty"`
+	ObjectID        string         `json:"object_id,omitempty"`
+	Timestamp       string         `json:"timestamp"`
+	Payload         map[string]any `json:"payload"`
 }
 
 type AvailableFile struct {
@@ -144,6 +155,45 @@ type DownloadFailPayload struct {
 	Message   string         `json:"message"`
 	Retryable bool           `json:"retryable"`
 	Details   map[string]any `json:"details,omitempty"`
+}
+
+type ArchiveRequestLeaseResponse struct {
+	Request *ArchiveRequest `json:"request"`
+}
+
+type ArchiveRequest struct {
+	RequestID      string          `json:"request_id,omitempty"`
+	ID             string          `json:"id,omitempty"`
+	LeaseID        string          `json:"lease_id,omitempty"`
+	LeaseToken     string          `json:"lease_token,omitempty"`
+	LeaseExpiresAt string          `json:"lease_expires_at,omitempty"`
+	TenantID       string          `json:"tenant_id,omitempty"`
+	TargetType     string          `json:"target_type,omitempty"`
+	TargetID       string          `json:"target_id,omitempty"`
+	ActionType     string          `json:"action_type,omitempty"`
+	ActionPayload  json.RawMessage `json:"action_payload,omitempty"`
+	RequestedBy    string          `json:"requested_by,omitempty"`
+	DedupeKey      string          `json:"dedupe_key,omitempty"`
+	Status         string          `json:"status,omitempty"`
+	FailureReason  *string         `json:"failure_reason,omitempty"`
+	FailureDetails json.RawMessage `json:"failure_details,omitempty"`
+	CreatedAt      string          `json:"created_at,omitempty"`
+	UpdatedAt      string          `json:"updated_at,omitempty"`
+	CompletedAt    *string         `json:"completed_at,omitempty"`
+}
+
+type ArchiveRequestFailPayload struct {
+	Code      string         `json:"code"`
+	Message   string         `json:"message"`
+	Retryable bool           `json:"retryable"`
+	Details   map[string]any `json:"details,omitempty"`
+}
+
+func (r *ArchiveRequest) EffectiveRequestID() string {
+	if strings.TrimSpace(r.RequestID) != "" {
+		return r.RequestID
+	}
+	return r.ID
 }
 
 func (r *DownloadRequest) EffectiveRequestID() string {
@@ -287,6 +337,50 @@ func (c *Client) LeaseNextDownloadRequest(ctx context.Context) (*DownloadRequest
 		return nil, err
 	}
 	return resp.Request, nil
+}
+
+func (c *Client) LeaseArchiveRequest(ctx context.Context, actionType string) (*ArchiveRequest, error) {
+	var body any
+	actionType = strings.TrimSpace(actionType)
+	if actionType != "" {
+		body = map[string]string{"action_type": actionType}
+	}
+	var resp ArchiveRequestLeaseResponse
+	if err := c.doJSON(ctx, http.MethodPost, "/api/archive-requests/lease", body, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Request, nil
+}
+
+func (c *Client) HeartbeatArchiveRequest(ctx context.Context, requestID, leaseToken string) (*ArchiveRequest, error) {
+	body := map[string]string{"lease_token": leaseToken}
+	var resp ArchiveRequestLeaseResponse
+	path := fmt.Sprintf("/api/archive-requests/%s/lease/heartbeat", url.PathEscape(requestID))
+	if err := c.doJSON(ctx, http.MethodPost, path, body, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Request, nil
+}
+
+func (c *Client) ReleaseArchiveRequest(ctx context.Context, requestID, leaseToken string) error {
+	body := map[string]string{"lease_token": leaseToken}
+	path := fmt.Sprintf("/api/archive-requests/%s/lease/release", url.PathEscape(requestID))
+	return c.doJSON(ctx, http.MethodPost, path, body, nil)
+}
+
+func (c *Client) CompleteArchiveRequest(ctx context.Context, requestID, leaseToken string) error {
+	body := map[string]string{"lease_token": leaseToken}
+	path := fmt.Sprintf("/api/archive-requests/%s/complete", url.PathEscape(requestID))
+	return c.doJSON(ctx, http.MethodPost, path, body, nil)
+}
+
+func (c *Client) FailArchiveRequest(ctx context.Context, requestID, leaseToken string, payload ArchiveRequestFailPayload) error {
+	body := map[string]any{
+		"lease_token": leaseToken,
+		"failure":     payload,
+	}
+	path := fmt.Sprintf("/api/archive-requests/%s/fail", url.PathEscape(requestID))
+	return c.doJSON(ctx, http.MethodPost, path, body, nil)
 }
 
 func (c *Client) HeartbeatDownloadRequest(ctx context.Context, requestID, leaseToken string) (*DownloadRequest, error) {
